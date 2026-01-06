@@ -1,0 +1,25 @@
+{
+  "run_id": "b6f817b6-af0c-4938-b59d-49463fff2984",
+  "started_at": "2026-01-05T14:54:10.342790+00:00",
+  "finished_at": "2026-01-05T14:54:13.195373+00:00",
+  "months": 24,
+  "excel_path": "data/b6f817b6-af0c-4938-b59d-49463fff2984_places.xlsx",
+  "report_path": "data/b6f817b6-af0c-4938-b59d-49463fff2984_run_report.json",
+  "cities_requested": [
+    "London, UK"
+  ],
+  "city_results": [
+    {
+      "input": {
+        "raw": "London, UK",
+        "city": "London",
+        "region": "",
+        "country": "UK"
+      },
+      "status": "empty",
+      "error": "",
+      "exhibitions_found": 0,
+      "exhibitions": []
+    }
+  ]
+}

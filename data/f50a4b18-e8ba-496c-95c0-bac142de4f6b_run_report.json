@@ -1,0 +1,74 @@
+{
+  "run_id": "f50a4b18-e8ba-496c-95c0-bac142de4f6b",
+  "started_at": "2026-01-05T14:50:55.165986+00:00",
+  "finished_at": "2026-01-05T14:51:50.503819+00:00",
+  "months": 24,
+  "excel_path": "data/f50a4b18-e8ba-496c-95c0-bac142de4f6b_places.xlsx",
+  "report_path": "data/f50a4b18-e8ba-496c-95c0-bac142de4f6b_run_report.json",
+  "cities_requested": [
+    "London, UK"
+  ],
+  "city_results": [
+    {
+      "input": {
+        "raw": "London, UK",
+        "city": "London",
+        "region": "",
+        "country": "UK"
+      },
+      "status": "ok",
+      "error": "",
+      "exhibitions_found": 1,
+      "exhibitions": [
+        {
+          "Name of site, City": "David Hockney, Exhibition, Serpentine North Gallery, London: 12th March–23rd August 2026",
+          "City": "London",
+          "Country": "UK",
+          "Full address": "West Carriage Drive, Kensington Gardens, London W2 2AR",
+          "Type(s) of activity": "",
+          "Divento Categories": "Whats_Hot",
+          "Free activity?": "1",
+          "Long description": "<p>Bright colours and sweeping gestures fill the gallery as Hockney’s recent works unfold across the walls. The exhibition opens with his iPad paintings created during lockdown, including the Sunrise series, which pulses with light and movement. A Year in Normandy stretches nearly ninety metres, inspired by the Bayeux Tapestry, and traces the changing seasons at his Normandy studio. Moon Room offers a quieter moment, where shifting light and time passing become almost tangible.</p><p>Don’t miss the immersive frieze that wraps around the space, drawing the eye from one scene to the next, and the iPad sketches that feel immediate and alive. A hidden gem lies in the small studies tucked into corners—delicate works on paper that reveal Hockney’s process and playful experimentation. The exhibition also includes monotypes and drawings that add texture and depth, offering insight into how he moves between media.</p><p>The show invites close looking: the frieze’s detail rewards patience, the digital works encourage lingering, and the quieter pieces offer moments of discovery. The contrast between bold, sweeping compositions and intimate sketches keeps the experience dynamic and grounded in observation.</p>",
+          "Long description fr": "<p>Des couleurs éclatantes et des gestes amples envahissent la galerie tandis que les œuvres récentes de Hockney se déploient sur les murs. L’exposition s’ouvre sur ses peintures réalisées sur iPad pendant le confinement, dont la série Sunrise, qui vibre de lumière et de mouvement. <em>A Year in Normandy</em>, inspirée de la Tapisserie de Bayeux, s’étend sur près de quatre-vingt-dix mètres et retrace le passage des saisons dans son atelier normand. La <em>Moon Room</em> offre un moment plus paisible, où la lumière changeante et le temps qui passe deviennent presque palpables.</p><p>Ne manquez pas la frise immersive qui enveloppe l’espace, guidant le regard d’une scène à l’autre, ainsi que les croquis sur iPad, immédiats et pleins de vie. Un trésor caché se trouve dans les petites études nichées dans les recoins—des œuvres délicates sur papier qui révèlent le processus de Hockney et son esprit d’expérimentation ludique. L’exposition comprend également des monotypes et des dessins qui ajoutent texture et profondeur, offrant un aperçu de la façon dont il navigue entre les différents médiums.</p><p>L’exposition invite à une observation attentive : le détail de la frise récompense la patience, les œuvres numériques incitent à s’attarder, et les pièces plus discrètes offrent des moments de découverte. Le contraste entre les compositions audacieuses et amples et les esquisses plus intimes rend l’expérience à la fois dynamique et ancrée dans l’observation.</p>",
+          "Long description es": "<p>Colores vibrantes y gestos amplios llenan la galería mientras las obras recientes de Hockney se despliegan a lo largo de las paredes. La exposición comienza con sus pinturas en iPad creadas durante el confinamiento, incluyendo la serie Amanecer, que palpita con luz y movimiento. Un Año en Normandía se extiende a lo largo de casi noventa metros, inspirado en el Tapiz de Bayeux, y retrata el cambio de estaciones en su estudio de Normandía. La Sala de la Luna ofrece un momento más tranquilo, donde la luz cambiante y el paso del tiempo se vuelven casi tangibles.</p><p>No te pierdas el friso envolvente que rodea el espacio, guiando la mirada de una escena a otra, y los bocetos en iPad que se sienten inmediatos y llenos de vida. Una joya escondida se encuentra en los pequeños estudios ocultos en los rincones: delicadas obras sobre papel que revelan el proceso de Hockney y su experimentación lúdica. La exposición también incluye monotipos y dibujos que aportan textura y profundidad, ofreciendo una visión de cómo se mueve entre distintos medios.</p><p>La muestra invita a mirar de cerca: el detalle del friso recompensa la paciencia, las obras digitales animan a detenerse, y las piezas más tranquilas ofrecen momentos de descubrimiento. El contraste entre composiciones audaces y expansivas y bocetos íntimos mantiene la experiencia dinámica y anclada en la observación.</p>",
+          "Long description it": "<p>Colori vivaci e gesti ampi riempiono la galleria mentre le opere recenti di Hockney si svelano sulle pareti. La mostra si apre con i suoi dipinti su iPad realizzati durante il lockdown, inclusa la serie Sunrise, che pulsa di luce e movimento. A Year in Normandy si estende per quasi novanta metri, ispirata all’arazzo di Bayeux, e segue il mutare delle stagioni nel suo studio in Normandia. La Moon Room offre un momento più raccolto, dove la luce che cambia e il tempo che passa diventano quasi tangibili.</p><p>Non perdere il fregio immersivo che avvolge lo spazio, guidando lo sguardo da una scena all’altra, e gli schizzi su iPad che trasmettono immediatezza e vitalità. Un piccolo gioiello si nasconde negli studi raccolti negli angoli: opere delicate su carta che rivelano il processo creativo di Hockney e la sua sperimentazione giocosa. La mostra include anche monotipi e disegni che aggiungono texture e profondità, offrendo uno sguardo su come l’artista si muove tra diversi media.</p><p>La mostra invita a uno sguardo attento: i dettagli del fregio premiano la pazienza, le opere digitali incoraggiano a soffermarsi, e i pezzi più silenziosi regalano momenti di scoperta. Il contrasto tra le composizioni audaci e ampie e gli schizzi più intimi mantiene l’esperienza dinamica e radicata nell’osservazione.</p>",
+          "Long description ru": "<p>Галерея наполняется яркими красками и широкими мазками, когда новые работы Хокни разворачиваются на стенах. Выставка начинается с его iPad-картин, созданных во время локдауна, включая серию «Восход», которая пульсирует светом и движением. «Год в Нормандии» растягивается почти на девяносто метров, вдохновлённый Байёским гобеленом, и передаёт смену времён года в его нормандской студии. «Лунная комната» предлагает более спокойный момент, где меняющийся свет и течение времени становятся почти осязаемыми.</p><p>Не пропустите захватывающий фриз, который опоясывает пространство, увлекая взгляд от одной сцены к другой, а также iPad-эскизы, наполненные живостью и непосредственностью. Настоящая находка — небольшие этюды, спрятанные в уголках, — изящные работы на бумаге, раскрывающие творческий процесс Хокни и его игривые эксперименты. На выставке также представлены монотипии и рисунки, придающие глубину и фактуру, позволяющие увидеть, как художник свободно перемещается между разными техниками.</p><p>Экспозиция приглашает к внимательному созерцанию: детали фриза вознаграждают терпеливых, цифровые работы побуждают задержаться, а более тихие произведения дарят моменты открытия. Контраст между смелыми, масштабными композициями и интимными зарисовками делает впечатления яркими и насыщенными наблюдением.</p>",
+          "Long description zh": "<p>霍克尼的近期作品在画廊墙面上铺展开来，明亮的色彩与奔放的笔触交织其间。展览以他在封锁期间用iPad创作的绘画开场，其中包括充满光感与动感的《日出》系列。长达近九十米的《诺曼底的一年》受到巴约挂毯的启发，描绘了他在诺曼底工作室四季更替的景象。月光房则营造出一片静谧时刻，流转的光影与时光几乎触手可及。</p><p>千万不要错过环绕整个空间的沉浸式壁画，它引导着观众的目光从一个场景流转到下一个，还有那些充满生命力和即时感的iPad速写。角落里隐藏着小巧的珍品——精致的纸上习作，展现了霍克尼的创作过程与富有趣味的实验精神。展览还包括单版画和素描，为整体增添了层次与质感，让观众得以深入了解他在不同媒介间的自由切换。</p><p>这场展览邀请观众细细品味：壁画的细节值得耐心欣赏，数字作品令人流连忘返，而安静的作品则带来意外的发现。大胆奔放的构图与私密细腻的速写形成鲜明对比，让整个观展体验既充满活力，又扎根于细致的观察之中。</p>",
+          "URL of images": "",
+          "Legends of images": "",
+          "Duration of visit": "1.5",
+          "Opening and closing time": "",
+          "Short description": "Explore Hockney’s recent works and iPad paintings in a vivid retrospective that invites reflection on nature and time.",
+          "Short description fr": "Découvrez les œuvres récentes de Hockney ainsi que ses peintures sur iPad dans une rétrospective éclatante qui invite à la réflexion sur la nature et le temps.",
+          "Short description es": "Explora las obras más recientes de Hockney y sus pinturas en iPad en una vívida retrospectiva que invita a reflexionar sobre la naturaleza y el tiempo.",
+          "Short description it": "Esplora le opere recenti di Hockney e i suoi dipinti su iPad in una vivace retrospettiva che invita a riflettere sulla natura e sul tempo.",
+          "Short description ru": "Исследуйте новейшие работы Хокни и его картины на iPad в яркой ретроспективе, которая приглашает задуматься о природе и времени.",
+          "Short description zh": "探索霍克尼的最新作品及其iPad绘画，在这场生动的回顾展中，邀您一同感受对自然与时间的深刻思考。",
+          "Meta description": "Explore Hockney’s recent works and iPad paintings in a vivid retrospective that invites reflection on nature and time.",
+          "Meta description fr": "Découvrez les œuvres récentes de Hockney ainsi que ses peintures sur iPad dans une rétrospective éclatante qui invite à la réflexion sur la nature et le temps.",
+          "Meta description es": "Explora las obras más recientes de Hockney y sus pinturas en iPad en una vívida retrospectiva que invita a reflexionar sobre la naturaleza y el tiempo.",
+          "Meta description it": "Esplora le opere recenti di Hockney e i suoi dipinti su iPad in una vivace retrospettiva che invita a riflettere sulla natura e sul tempo.",
+          "Meta description ru": "Исследуйте новейшие работы Хокни и его картины на iPad в яркой ретроспективе, которая приглашает задуматься о природе и времени.",
+          "Meta description zh": "探索霍克尼的最新作品及其iPad绘画，在这场生动的回顾展中，邀您一同感受对自然与时间的深刻思考。",
+          "Latitude": "51.5065",
+          "Information": "Entry to the Serpentine Galleries is free, though booking a ticket is advised. The gallery café is open during exhibition hours.",
+          "Longitude": "-0.1657",
+          "Activity type": "",
+          "Rating": "4",
+          "Name of site city": "David Hockney, Exhibition, Serpentine North Gallery, London: 12th March–23rd August 2026",
+          "Name of site city fr": "David Hockney, Exposition, Serpentine North Gallery, Londres : du 12 mars au 23 août 2026",
+          "Name of site city es": "David Hockney, Exposición, Serpentine North Gallery, Londres: 12 de marzo–23 de agosto de 2026",
+          "Name of site city it": "David Hockney, Mostra, Serpentine North Gallery, Londra: 12 marzo–23 agosto 2026",
+          "Name of site city ru": "Дэвид Хокни, выставка, галерея Серpентайн Норт, Лондон: 12 марта – 23 августа 2026",
+          "Name of site city zh": "大卫·霍克尼展览，伦敦蛇形北画廊：2026年3月12日–8月23日",
+          "Real city": "London",
+          "Start date (YYYY-MM-DD)": "2026-03-12",
+          "End date (YYYY-MM-DD)": "2026-08-23",
+          "Venue category path": "UK, London, Serpentine North Gallery",
+          "Repeat pattern": "daily",
+          "Open days": "Tue,Wed,Thu,Fri,Sat,Sun"
+        }
+      ]
+    }
+  ]
+}

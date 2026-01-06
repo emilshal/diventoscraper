@@ -20,52 +20,52 @@ from app.core.ml import classify
 LANGUAGES = ["fr", "es", "it", "ru", "zh-CN"]
 
 TEMPORARY_COLUMNS_ORDER = [
-    "Name of site, City",           # A
-    "City",                         # B
-    "Country",                      # C
-    "Full address",                 # D
-    "Type(s) of activity",          # E
-    "Divento Categories",           # F
-    "Free activity?",               # G
-    "Long description",             # H
-    "Long description fr",          # I
-    "Long description es",          # J
-    "Long description it",          # K
-    "Long description ru",          # L
-    "Long description zh",          # M
-    "URL of images",                # N
-    "Legends of images",            # O
-    "Duration of visit",            # P
-    "Opening and closing time",     # Q
-    "Short description",            # R
-    "Short description fr",         # S
-    "Short description es",         # T
-    "Short description it",         # U
-    "Short description ru",         # V
-    "Short description zh",         # W
-    "Meta description",             # X
-    "Meta description fr",          # Y
-    "Meta description es",          # Z
-    "Meta description it",          # AA
-    "Meta description ru",          # AB
-    "Meta description zh",          # AC
-    "Latitude",                     # AD
-    "Information",                  # AE
-    "Longitude",                    # AF
-    "Activity type",                # AG
-    "Rating",                       # AH
-    "Name of site city",            # AI
-    "Name of site city fr",         # AJ
-    "Name of site city es",         # AK
-    "Name of site city it",         # AL
-    "Name of site city ru",         # AM
-    "Name of site city zh",         # AN
-    "Real city",                    # AO
-    "Start date (YYYY-MM-DD)",      # AP
-    "End date (YYYY-MM-DD)",        # AQ
-    "Venue category path",          # AR
-    "Repeat pattern",               # AS
-    "Open days",                    # AT
+    "Name of site, City",  # A
+    "City",  # B
+    "Country",  # C
+    "Full address",  # D
+    "Type(s) of activity",  # E
+    "Divento Categories",  # F
+    "Free activity?",  # G
+    "Long description",  # H
+    "Long description fr",  # I
+    "Long description es",  # J
+    "Long description it",  # K
+    "Long description ru",  # L
+    "Long description zh",  # M
+    "URL of images",  # N
+    "Legends of images",  # O
+    "Duration of visit",  # P
+    "Opening and closing time",  # Q
+    "Short description",  # R
+    "Short description fr",  # S
+    "Short description es",  # T
+    "Short description it",  # U
+    "Short description ru",  # V
+    "Short description zh",  # W
+    "Meta description",  # X
+    "Meta description fr",  # Y
+    "Meta description es",  # Z
+    "Meta description it",  # AA
+    "Meta description ru",  # AB
+    "Meta description zh",  # AC
+    "Latitude",  # AD
+    "Information",  # AE
+    "Longitude",  # AF
+    "Activity type",  # AG
+    "Rating",  # AH
+    "Name of site city",  # AI
+    "Name of site city fr",  # AJ
+    "Name of site city es",  # AK
+    "Name of site city it",  # AL
+    "Name of site city ru",  # AM
+    "Name of site city zh",  # AN
+    "Real city",  # AO
+    "Start date (YYYY-MM-DD)",  # AP
+    "End date (YYYY-MM-DD)",  # AQ
+    "Venue category path",  # AR
+    "Repeat pattern",  # AS
+    "Open days",  # AT
 ]
 
 
@@ -73,6 +73,10 @@ ua = UserAgent()
 client: OpenAI | None = None
 if settings.OPENAI_API_KEY:
     client = OpenAI(api_key=settings.OPENAI_API_KEY)
+
+
+# Model selection (temporary exhibitions only)
+TEMP_MODEL = settings.OPENAI_TEMP_MODEL
 
 
 def _ordinal_day(n: int) -> str:
@@ -233,9 +237,8 @@ def _translate_text(text: str, lang: str) -> str:
     )
     try:
         resp = client.chat.completions.create(
-            model="gpt-4.1",
+            model=TEMP_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
         )
         return resp.choices[0].message.content.strip()
     except Exception:
@@ -285,6 +288,11 @@ def _fetch_temporary_exhibitions_window(
 
     today_iso = window_start.isoformat()
     end_iso = window_end.isoformat()
+    select_clause = (
+        f"- Return exactly {target_max} distinct exhibition (no duplicates).\n\n"
+        if target_max <= 1
+        else "- Return as many exhibitions as you can find for this window: it is VERY IMPORTANT to reach 10 to 20 distinct exhibitions. Search deeply across multiple venues/sources, keep count, and keep adding until you hit the maximum or truly run out. No duplicates.\n\n"
+    )
     prompt = (
         "I need to create new exhibitions for Divento.\n"
         "Please follow these steps exactly.\n\n"
@@ -295,12 +303,12 @@ def _fetch_temporary_exhibitions_window(
         f"and {end_iso} (inclusive).\n"
         f"- Include exhibitions that started before {today_iso} but are still running during this window (any date overlap counts).\n"
         "- Only include temporary exhibitions, not permanent collections or long-term displays.\n"
-        "- Return as many exhibitions as you can find for this window: it is VERY IMPORTANT to reach 10 to 20 distinct exhibitions. Search deeply across multiple venues/sources, keep count, and keep adding until you hit the maximum or truly run out. No duplicates.\n\n"
+        f"{select_clause}"
         "2. Create Divento text\n"
         "For each exhibition, you must provide the following fields:\n"
         "- name: exhibition label formatted as "
-        "\"Exhibition name, Exhibition, Venue, City: Dates\" unless the word "
-        "\"exhibition\" is already in the exhibition name (then do not repeat it).\n"
+        '"Exhibition name, Exhibition, Venue, City: Dates" unless the word '
+        '"exhibition" is already in the exhibition name (then do not repeat it).\n'
         "- city: the city where the exhibition takes place.\n"
         "- country: the country for that city.\n"
         "- address: the full postal address of the venue.\n"
@@ -333,7 +341,7 @@ def _fetch_temporary_exhibitions_window(
         "Ensure consistent and correct spacing throughout. Do not begin the long description with the name of the exhibition, and avoid concluding sentences or the use of dashes. "
         "Wrap each paragraph in <p> tags and use appropriate HTML tags and entities where needed. Never use the first person. "
         "Each long description should be between 350 and 400 words, aiming for the higher end. Break the content into multiple paragraphs. "
-        "Try to include one highlight, two \"don't miss\" elements, and one \"hidden gem\" but incorporate them smoothly into the text. Mention specific exhibits. "
+        'Try to include one highlight, two "don\'t miss" elements, and one "hidden gem" but incorporate them smoothly into the text. Mention specific exhibits. '
         "For the short description: do not include the name of the exhibition. It must be no more than 164 characters. It must contain a verb, and must not repeat the phrasing or start of the long description. "
         "Return the text in JSON format within the short and long fields.\n\n"
         "3. Pricing and ticketing\n"
@@ -353,18 +361,21 @@ def _fetch_temporary_exhibitions_window(
         "be an object with exactly the keys: "
         "'name', 'city', 'country', 'address', 'duration', 'start_date', 'end_date', "
         "'short', 'long', 'is_free', 'ticket_url', 'information', 'venue', 'latitude', 'longitude', 'repeat_pattern', 'open_days'."
+        "And once again, please remember to avoid the use of any dashes and do not include citations."
+        "VERY IMPORTANT also remember each long description must be at least 350 words, and short descriptions must never exceed 164 characters."
     )
 
     try:
         try:
             resp = client.responses.create(
-                model="gpt-4.1",
+                model=TEMP_MODEL,
                 input=prompt,
                 tools=[{"type": "web_search"}],
                 max_output_tokens=12000,
-                temperature=0.2,
             )
-            content = _clean_json_content(resp.output_text or _extract_response_text(resp))
+            content = _clean_json_content(
+                resp.output_text or _extract_response_text(resp)
+            )
         except Exception as exc_resp:
             print("DEBUG Responses API error:", repr(exc_resp))
             content = ""
@@ -372,10 +383,9 @@ def _fetch_temporary_exhibitions_window(
         def _chat_retry():
             try:
                 resp_chat = client.chat.completions.create(
-                    model="gpt-4.1",
+                    model=TEMP_MODEL,
                     messages=[{"role": "user", "content": prompt}],
-                    temperature=0.2,
-                    max_tokens=12000,
+                    max_completion_tokens=12000,
                 )
                 return _clean_json_content(resp_chat.choices[0].message.content or "")
             except Exception as exc_chat:
@@ -395,7 +405,9 @@ def _fetch_temporary_exhibitions_window(
 
         data = _extract_json_array(content)
         if data is None:
-            print("DEBUG _fetch_temporary_exhibitions_window JSON parse failed, raw content follows:")
+            print(
+                "DEBUG _fetch_temporary_exhibitions_window JSON parse failed, raw content follows:"
+            )
             print(content)
             print("DEBUG _fetch_temporary_exhibitions_window retrying chat")
             content_retry = _chat_retry()
@@ -405,7 +417,9 @@ def _fetch_temporary_exhibitions_window(
                 print(content_retry)
                 data = _extract_json_array(content_retry)
             if data is None:
-                print("DEBUG _fetch_temporary_exhibitions_window JSON parse failed after retry")
+                print(
+                    "DEBUG _fetch_temporary_exhibitions_window JSON parse failed after retry"
+                )
                 return []
         print("DEBUG _fetch_temporary_exhibitions_window parsed items:", len(data))
 
@@ -430,10 +444,17 @@ def _fetch_temporary_exhibitions_window(
             item["venue"] = (item.get("venue") or "").strip()
             item["city"] = (item.get("city") or city).strip()
             item["country"] = _abbrev_country((item.get("country") or "").strip())
-            item["address"] = _abbrev_country_in_address((item.get("address") or "").strip(), item["country"])
+            item["address"] = _abbrev_country_in_address(
+                (item.get("address") or "").strip(), item["country"]
+            )
             filtered.append(item)
 
-        print("DEBUG _fetch_temporary_exhibitions_window kept items after window filter:", len(filtered))
+        print(
+            "DEBUG _fetch_temporary_exhibitions_window kept items after window filter:",
+            len(filtered),
+        )
+        if target_max > 0 and len(filtered) > target_max:
+            filtered = filtered[:target_max]
         return filtered
     except Exception as exc:
         print("DEBUG _fetch_temporary_exhibitions_window OpenAI error:", repr(exc))
@@ -476,7 +497,7 @@ def scrape_temporary_exhibitions(
         city,
         datetime.utcnow().date(),
         datetime.utcnow().date() + relativedelta(months=months),
-        target_min=0,
+        target_min=1,
         target_max=20,
     )
     rows: list[dict] = []
@@ -517,9 +538,13 @@ def scrape_temporary_exhibitions(
         translations = {lang: {"short": "", "long": ""} for lang in languages}
         for lang in languages:
             if short_desc:
-                translations[lang]["short"] = short_desc if lang == "en" else _translate_text(short_desc, lang)
+                translations[lang]["short"] = (
+                    short_desc if lang == "en" else _translate_text(short_desc, lang)
+                )
             if long_desc:
-                translations[lang]["long"] = long_desc if lang == "en" else _translate_text(long_desc, lang)
+                translations[lang]["long"] = (
+                    long_desc if lang == "en" else _translate_text(long_desc, lang)
+                )
 
         if not venue and name:
             head = name.split(":", 1)[0]
@@ -532,7 +557,11 @@ def scrape_temporary_exhibitions(
         name_head = (name.split(":", 1)[0] if name else "").strip()
         name_head = re.sub(r"\(.*?\)", "", name_head).strip()
         title_seed = name_head or venue or city_label
-        parts = [p.strip() for p in title_seed.split(",") if p.strip()] if title_seed else []
+        parts = (
+            [p.strip() for p in title_seed.split(",") if p.strip()]
+            if title_seed
+            else []
+        )
         base_core = parts[0] if parts else title_seed
         base_segments = [base_core] if base_core else []
         if base_core and "exhibition" not in base_core.lower():
@@ -631,7 +660,9 @@ def scrape_temporary_exhibitions(
                 "zh": "Meta description zh",
             }.get(code)
             if meta_key:
-                row[meta_key] = translations[lang]["short"] or translations[lang]["long"]
+                row[meta_key] = (
+                    translations[lang]["short"] or translations[lang]["long"]
+                )
 
         rows.append(row)
 
