@@ -1,0 +1,40 @@
+{
+  "run_id": "54c0a93b-f56b-406b-978e-a17e46a3732a",
+  "started_at": "2026-01-16T14:29:19.947058+00:00",
+  "finished_at": "2026-01-16T14:29:23.751391+00:00",
+  "months": 24,
+  "status": "empty",
+  "error": "",
+  "excel_path": "data/Rome-Italy_Barcelona-Spain_20260116_142919_54c0a93b-f56b-406b-978e-a17e46a3732a_places.xlsx",
+  "report_path": "data/54c0a93b-f56b-406b-978e-a17e46a3732a_run_report.json",
+  "cities_requested": [
+    "Rome, Italy",
+    "Barcelona, Spain"
+  ],
+  "city_results": [
+    {
+      "input": {
+        "raw": "Rome, Italy",
+        "city": "Rome",
+        "region": "",
+        "country": "Italy"
+      },
+      "status": "empty",
+      "error": "",
+      "exhibitions_found": 0,
+      "exhibitions": []
+    },
+    {
+      "input": {
+        "raw": "Barcelona, Spain",
+        "city": "Barcelona",
+        "region": "",
+        "country": "Spain"
+      },
+      "status": "empty",
+      "error": "",
+      "exhibitions_found": 0,
+      "exhibitions": []
+    }
+  ]
+}

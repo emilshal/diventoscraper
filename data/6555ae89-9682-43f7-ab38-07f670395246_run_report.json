@@ -1,0 +1,40 @@
+{
+  "run_id": "6555ae89-9682-43f7-ab38-07f670395246",
+  "started_at": "2026-01-16T14:39:22.391694+00:00",
+  "finished_at": "2026-01-16T14:39:39.590341+00:00",
+  "months": 24,
+  "status": "empty",
+  "error": "",
+  "excel_path": "data/Paris-France_Barcelona-Spain_20260116_143922_6555ae89-9682-43f7-ab38-07f670395246_places.xlsx",
+  "report_path": "data/6555ae89-9682-43f7-ab38-07f670395246_run_report.json",
+  "cities_requested": [
+    "Paris, France",
+    "Barcelona, Spain"
+  ],
+  "city_results": [
+    {
+      "input": {
+        "raw": "Paris, France",
+        "city": "Paris",
+        "region": "",
+        "country": "France"
+      },
+      "status": "empty",
+      "error": "",
+      "exhibitions_found": 0,
+      "exhibitions": []
+    },
+    {
+      "input": {
+        "raw": "Barcelona, Spain",
+        "city": "Barcelona",
+        "region": "",
+        "country": "Spain"
+      },
+      "status": "empty",
+      "error": "",
+      "exhibitions_found": 0,
+      "exhibitions": []
+    }
+  ]
+}

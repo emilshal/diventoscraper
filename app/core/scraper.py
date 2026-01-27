@@ -19,11 +19,9 @@ categories = (
     "Family", "Parks_and_Gardens", "Historic_Houses_and_Sites",
 )
 
-
-openai.api_key = settings.OPENAI_API_KEY
-
 def _generate_descriptions(place: str, city: str) -> tuple[str, str]:
     """Return short and long descriptions using ChatGPT."""
+    openai.api_key = settings.OPENAI_API_KEY
     if not openai.api_key:
         return "", ""
 
@@ -75,6 +73,7 @@ LANGUAGES = ["fr", "es", "it", "ru", "zh-CN"]
 
 def _translate_text(text: str, lang: str) -> str:
     """Translate text using ChatGPT."""
+    openai.api_key = settings.OPENAI_API_KEY
     if not text or not openai.api_key:
         return ""
     prompt = (

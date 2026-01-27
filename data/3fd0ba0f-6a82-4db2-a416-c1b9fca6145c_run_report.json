@@ -1,0 +1,40 @@
+{
+  "run_id": "3fd0ba0f-6a82-4db2-a416-c1b9fca6145c",
+  "started_at": "2026-01-14T09:25:30.030936+00:00",
+  "finished_at": "2026-01-14T09:25:53.963870+00:00",
+  "months": 24,
+  "status": "empty",
+  "error": "",
+  "excel_path": "data/3fd0ba0f-6a82-4db2-a416-c1b9fca6145c_places.xlsx",
+  "report_path": "data/3fd0ba0f-6a82-4db2-a416-c1b9fca6145c_run_report.json",
+  "cities_requested": [
+    "London, UK",
+    "Rome, Italy"
+  ],
+  "city_results": [
+    {
+      "input": {
+        "raw": "London, UK",
+        "city": "London",
+        "region": "",
+        "country": "UK"
+      },
+      "status": "empty",
+      "error": "",
+      "exhibitions_found": 0,
+      "exhibitions": []
+    },
+    {
+      "input": {
+        "raw": "Rome, Italy",
+        "city": "Rome",
+        "region": "",
+        "country": "Italy"
+      },
+      "status": "empty",
+      "error": "",
+      "exhibitions_found": 0,
+      "exhibitions": []
+    }
+  ]
+}
