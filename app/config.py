@@ -15,9 +15,33 @@ class Settings(BaseSettings):
     OPENAI_TEMP_COPY_MODEL: str = "gpt-5-mini"
     TEMP_COPY_CONCURRENCY: int = 2
     TEMP_TRANSLATION_CONCURRENCY: int = 4
-    TEMP_SEARCH_PASSES: int = 2
+    # Search strategy controls (temporary exhibitions scraper).
+    TEMP_SEARCH_PASSES: int = 5
+    TEMP_TARGET_MIN_EXHIBITIONS: int = 15
+    # When `TEMP_MAX_EXHIBITIONS=0`, we try to find "as many as possible" but still
+    # enforce a hard safety cap to avoid runaway runs.
+    TEMP_HARD_MAX_EXHIBITIONS: int = 200
+    # Soft per-pass cap to keep prompts+responses bounded.
+    TEMP_SEARCH_PASS_MAX_ITEMS: int = 60
+    TEMP_TARGET_MAX_EXHIBITIONS: int = 40
+    # Curated venue list (per city) to prioritize coverage.
+    TEMP_CURATED_VENUES_ENABLED: int = 1
+    TEMP_CURATED_VENUES_MAX_VENUES: int = 0  # 0 = all venues in the curated list
+    TEMP_CURATED_VENUES_MAX_ITEMS_PER_VENUE: int = 8
+    TEMP_VENUE_DISCOVERY_ENABLED: int = 1
+    TEMP_VENUE_DISCOVERY_MAX: int = 50
+    TEMP_VENUE_DEEPEN_PASSES: int = 1
+    TEMP_VENUE_DEEPEN_MAX_VENUES: int = 12
+    TEMP_VENUE_DEEPEN_MAX_PER_VENUE: int = 3
+    TEMP_GEO_CONCURRENCY: int = 4
+    TEMP_VENUE_HOURS_BACKFILL_ENABLED: int = 1
+    TEMP_VENUE_HOURS_BACKFILL_CONCURRENCY: int = 4
+    TEMP_VENUE_HOURS_FALLBACK_VALUE: str = "See venue website"
+    TEMP_IMAGE_FALLBACK_URL: str = "https://placehold.co/1200x800/png?text=Divento"
+    TEMP_IMAGE_FAVICON_SIZE: int = 256
     TEMP_MAX_CITIES: int = 0
-    TEMP_MAX_EXHIBITIONS: int = 20
+    # `0` means "no explicit cap" (subject to `TEMP_HARD_MAX_EXHIBITIONS`).
+    TEMP_MAX_EXHIBITIONS: int = 40
     RESULT_DIR: str = "./data"
     LOG_DIR: str = "./logs"
     LOG_LEVEL: str = "INFO"

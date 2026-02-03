@@ -11,3 +11,4 @@ __pycache__/
 # Local data outputs
 data/*.xlsx
 data/*.numbers
+data/*_run_report.json

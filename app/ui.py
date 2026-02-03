@@ -497,6 +497,20 @@ def start_run(req: RunRequest) -> dict[str, Any]:
     if not cities:
         raise HTTPException(status_code=400, detail="cities is required")
 
+    # Log the actual parsed city strings so we can spot UI input issues
+    # (e.g. two cities accidentally entered on the same line).
+    preview = cities[:6]
+    extra = max(0, len(cities) - len(preview))
+    logger.info(
+        "run_request cities=%s preview=%r extra=%s start_date=%s end_date=%s months=%s",
+        len(cities),
+        preview,
+        extra,
+        (req.start_date or "").strip(),
+        (req.end_date or "").strip(),
+        int(req.months or 24),
+    )
+
     start_date = (req.start_date or "").strip()
     end_date = (req.end_date or "").strip()
     months = int(req.months or 24)

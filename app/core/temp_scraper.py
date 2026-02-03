@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from html import unescape
 from urllib.parse import urlparse
+from urllib.parse import urljoin
 
 import pandas as pd
 import requests
@@ -26,6 +27,14 @@ from app.core.ml import classify
 LANGUAGES = ["fr", "es", "it", "ru", "zh-CN"]
 
 _TEMP_VENUE_IMAGE_CACHE: dict[str, str] = {}
+_TEMP_VENUE_COORD_CACHE: dict[str, tuple[str, str, str]] = {}
+_TEMP_VENUE_DISCOVERY_CACHE: dict[str, list[dict[str, str]]] = {}
+_TEMP_VENUE_HOURS_CACHE: dict[str, dict[str, str]] = {}
+
+_VENUE_OPENING_INFO_FALLBACK = (
+    getattr(settings, "TEMP_VENUE_HOURS_FALLBACK_VALUE", "See venue website")
+    or "See venue website"
+)
 
 _TEMP_SHORT_OPENERS = [
     "Trace",
@@ -89,6 +98,313 @@ _CITY_VENUE_HINTS: dict[str, list[str]] = {
     ],
 }
 
+_CITY_CURATED_VENUES: dict[str, list[str]] = {
+    # User-provided curated venue list (Paris, FR).
+    "paris": [
+        "Grand Palais",
+        "Musée de la Vie romantique",
+        "Jacquemart-André",
+        "Musée Cernuschi",
+        "Musée Bourdelle",
+        "Musée de Cluny – Musée national du Moyen Âge",
+        "Musée des Arts Décoratifs",
+        "Musée de l’Armée (Les Invalides)",
+        "Maison Européenne de la Photographie",
+        "Bourdelle Museum",
+        "Jeu de Paume",
+        "Institut du Monde Arabe",
+        "Louvre",
+        "Musée d’Orsay",
+        "Musée Carnavalet",
+        "Centre Pompidou",
+        "Musée de l’Homme",
+        "L'Orangerie",
+        "Musée d’Art Moderne de Paris",
+        "Musée de l’Orangerie",
+        "Musée de la Chasse et de la Nature",
+        "Monnaie de Paris",
+        "Fondation Louis Vuitton",
+        "Cité des Sciences et de l’Industrie",
+        "Musée Cognacq-Jay",
+        "Musée des Arts et Métiers",
+        "Musée du Luxembourg",
+        "Musée du Quai Branly – Jacques Chirac",
+        "Musée Guimet",
+        "Musée Jacquemart-André",
+        "Musée Marmottan Monet",
+        "Musée national de la Marine",
+        "Musée Nissim de Camondo",
+        "Musée Picasso Paris",
+        "Musée Rodin",
+        "Muséum national d’Histoire naturelle",
+        "Palais de Tokyo",
+        "Petit Palais",
+        "Zadkine Museum",
+    ],
+    # User-provided curated venue list (London, UK).
+    "london": [
+        "National Army Museum",
+        "Tate Modern",
+        "Courtauld Gallery",
+        "National Portrait Gallery",
+        "Wallace Collection",
+        "Whitechapel Gallery",
+        "Sir John Soane’s Museum",
+        "Victoria and Albert Museum",
+        "Leighton House",
+        "British Museum",
+        "National Gallery",
+        "Serpentine Galleries",
+        "Imperial War Museum",
+        "Design Museum",
+        "Royal Botanic Gardens, Kew",
+        "Wellcome Collection",
+        "Dulwich Picture Gallery",
+        "Tate Britain",
+        "Science Museum",
+        "Horniman Museum and Gardens",
+        "Royal Academy of Arts",
+        "Queen’s House, Greenwich",
+        "Photographers’ Gallery",
+        "London Transport Museum",
+        "London Museum (formerly Museum of London)",
+        "Royal Observatory Greenwich",
+        "Natural History Museum",
+        "National Maritime Museum, Greenwich",
+    ],
+    # User-provided curated venue list (Barcelona, ES).
+    "barcelona": [
+        "Fundació Antoni Tàpies",
+        "Museu d’Història de Barcelona (MUHBA)",
+        "Museu Europeu d’Art Modern (MEAM)",
+        "Fundació Joan Miró",
+        "Museu Nacional d’Art de Catalunya (MNAC)",
+        "Disseny Hub Barcelona (DHub)",
+        "Museu Marítim de Barcelona",
+        "Museu Egipci de Barcelona",
+        "Museu del Monestir de Pedralbes",
+        "CosmoCaixa",
+        "Museu de les Cultures del Món",
+        "CaixaForum Barcelona",
+        "Museu Olímpic i de l’Esport Joan Antoni Samaranch",
+        "Museu Picasso",
+        "Museu Frederic Marès",
+        "Museu del Modernisme Català",
+        "Museu de la Xocolata",
+        "MACBA – Museu d’Art Contemporani de Barcelona",
+        "CCCB – Centre de Cultura Contemporània de Barcelona",
+        "Museu de la Música",
+        "Palau Martorell",
+        "KBr Fundación MAPFRE",
+        "Fabra i Coats, Centre d’Art Contemporani",
+        "Casa Milà La Pedrera – Fundació Catalunya La Pedrera",
+        "Museu Diocesà de Barcelona",
+        "Museu de Ciències Naturals de Barcelona",
+        "Palau Robert",
+    ],
+    # User-provided curated venue list (Madrid, ES).
+    "madrid": [
+        "Museo Casa de Cervantes (Alcalá de Henares)",
+        "Museo Cerralbo",
+        "Museo del Traje",
+        "Museo Arqueológico Nacional",
+        "Museo del Ferrocarril de Madrid",
+        "Museo del Prado",
+        "Museo Casa de Lope de Vega",
+        "Museo de Historia de Madrid",
+        "Museo del Ejército",
+        "Museo del Romanticismo",
+        "Museo de América",
+        "Museo de Arte Contemporáneo de Madrid",
+        "Museo Geominero",
+        "Museo Lázaro Galdiano",
+        "Museo Nacional Centro de Arte Reina Sofía",
+        "Museo Nacional de Antropología",
+        "Museo Nacional de Artes Decorativas",
+        "Museo Naval",
+        "Museo Sorolla",
+        "Museo Thyssen-Bornemisza",
+        "Real Academia de Bellas Artes de San Fernando",
+        "Matadero",
+        "CaixaForum Madrid",
+        "Sala Canal de Isabel II",
+    ],
+    # User-provided curated venue list (Rome, IT).
+    "rome": [
+        "MAXXI – Museo nazionale delle arti del XXI secolo",
+        "Museo dell’Ara Pacis",
+        "Museo Nazionale di Castel Sant’Angelo",
+        "Palazzo Spada",
+        "Museo delle Civiltà",
+        "Vatican Museums",
+        "Museo di Palazzo Venezia",
+        "Palazzo Altemps",
+        "Palazzo Barberini",
+        "Musei Vaticani – Pinacoteca",
+        "Galleria Nazionale d’Arte Moderna e Contemporanea",
+        "Museo di San Clemente",
+        "Centrale Montemartini",
+        "Galleria Corsini",
+        "Musei Capitolini",
+        "Museo Nazionale degli Strumenti Musicali",
+        "Museo Nazionale Etrusco di Villa Giulia",
+        "Museo di Roma in Trastevere",
+        "Museo Napoleonico",
+        "Museo delle Mura",
+        "Palazzo Massimo alle Terme",
+        "Museo Nazionale Romano",
+        "Galleria Borghese",
+        "Museo di Roma",
+    ],
+    # User-provided curated venue list (Florence, IT).
+    "florence": [
+        "Museo Nazionale del Bargello",
+        "Museo dell’Opera del Duomo",
+        "Galleria dell’Accademia",
+        "Museo di Santa Maria Novella",
+        "Museo degli Innocenti",
+        "Museo Gucci",
+        "Museo Galileo",
+        "Galleria degli Uffizi",
+        "Museo di San Marco",
+        "Museo di Palazzo Davanzati",
+        "Museo Horne",
+        "Museo Stibbert",
+        "Cappelle Medicee",
+        "Museo Archeologico Nazionale di Firenze",
+        "Museo Salvatore Ferragamo",
+        "Casa Buonarroti",
+        "Museo di Palazzo Vecchio",
+        "Museo Stefano Bardini",
+        "Boboli Gardens",
+        "Palazzo Pitti",
+    ],
+    # User-provided curated venue list (Amsterdam, NL).
+    "amsterdam": [
+        "Hermitage Amsterdam",
+        "Foam – Fotografiemuseum Amsterdam",
+        "Rijksmuseum",
+        "Amsterdam Museum",
+        "H’ART Museum",
+        "Willet-Holthuysen Museum",
+        "Cobra Museum of Modern Art",
+        "Rembrandt House Museum",
+        "National Maritime Museum (Het Scheepvaartmuseum)",
+        "Tropenmuseum",
+        "Museum Van Loon",
+        "Moco Museum",
+        "Mauritshuis (The Hague)",
+        "Museum of Bags and Purses (Tassenmuseum)",
+        "Jewish Museum",
+        "Eye Filmmuseum",
+        "Stedelijk Museum",
+        "Van Gogh Museum",
+        "Our Lord in the Attic Museum (Ons’ Lieve Heer op Solder)",
+        "Stadsarchief Amsterdam",
+    ],
+    # User-provided curated venue list (Berlin, DE).
+    "berlin": [
+        "Hamburger Bahnhof – Museum für Gegenwart",
+        "Museum für Naturkunde",
+        "Museum für Fotografie",
+        "Museum für Asiatische Kunst (Humboldt Forum)",
+        "Pergamonmuseum",
+        "Technikmuseum",
+        "Kunstgewerbemuseum",
+        "Museum Europäischer Kulturen",
+        "Jüdisches Museum Berlin",
+        "Berlinische Galerie",
+        "Sammlung Boros",
+        "Neues Museum",
+        "Ethnologisches Museum (Humboldt Forum)",
+        "Museumsinsel (Pergamonmuseum, Neues Museum, Alte Nationalgalerie, Altes Museum, Bode Museum)",
+        "KW Institute for Contemporary Art",
+        "Bode Museum",
+        "Gropius Bau",
+        "Haus der Kulturen der Welt",
+        "Kupferstichkabinett",
+        "Neue Nationalgalerie",
+        "Gemäldegalerie",
+        "Alte Nationalgalerie",
+    ],
+    # User-provided curated venue list (Vienna, AT).
+    "vienna": [
+        "Albertina",
+        "Belvedere (Upper & Lower)",
+        "Technisches Museum Wien",
+        "Kunsthistorisches Museum",
+        "Kunst Haus Wien",
+        "Jewish Museum Vienna",
+        "Albertina Modern",
+        "mumok – Museum moderner Kunst Stiftung Ludwig Wien",
+        "Wien Museum",
+        "Museum für angewandte Kunst (MAK)",
+        "Leopold Museum",
+        "MAK – Museum of Applied Arts",
+        "Museum of Military History (Heeresgeschichtliches Museum)",
+        "Liechtenstein Museum",
+        "Sigmund Freud Museum",
+        "Mozart Museum (Mozarthaus Vienna)",
+        "Theatermuseum",
+        "Papyrus Museum",
+        "Imperial Treasury (Schatzkammer)",
+    ],
+    # User-provided curated venue list (Venice, IT).
+    "venice": [
+        "Gallerie dell’Accademia",
+        "Ca’ Rezzonico",
+        "Museo Fortuny",
+        "Palazzo Ducale",
+        "Scuola Grande di San Rocco",
+        "Arsenale",
+        "Peggy Guggenheim Collection",
+        "Palazzo Grassi",
+        "Museo Correr",
+        "Fondazione Prada Venezia (Ca’ Corner della Regina)",
+        "Ca’ Pesaro – Galleria Internazionale d’Arte Moderna",
+        "Punta della Dogana",
+        "Scuola Grande di San Giovanni Evangelista",
+        "Palazzo Mocenigo",
+        "Museo di Palazzo Grimani",
+        "Museo Archeologico Nazionale di Venezia",
+    ],
+    # User-provided curated venue list (Brussels, BE).
+    "brussels": [
+        "Royal Museums of Fine Arts of Belgium",
+        "Magritte Museum",
+        "BELvue Museum",
+        "Bozar (Centre for Fine Arts)",
+        "Museum of Natural Sciences",
+        "Autoworld",
+        "Oldmasters Museum",
+        "KANAL – Centre Pompidou",
+        "La Monnaie / De Munt",
+        "Musical Instruments Museum (MIM)",
+        "Fin-de-Siècle Museum",
+        "WIELS Contemporary Art Centre",
+        "Fashion & Lace Museum",
+        "Art & History Museum (Cinquantenaire)",
+        "La Loge",
+        "CENTRALE for contemporary art",
+    ],
+    # User-provided curated venue list (Lisbon, PT).
+    "lisbon": [
+        "MAAT – Museu de Arte, Arquitetura e Tecnologia",
+        "Museu Bordalo II",
+        "Museu Calouste Gulbenkian",
+        "Museu de Lisboa (Palácio Pimenta and other sites)",
+        "Museu do Aljube – Resistência e Liberdade",
+        "Museu do Chiado – Museu Nacional de Arte Contemporânea",
+        "Museu do Design (MUDE)",
+        "Museu do Oriente",
+        "Museu do Teatro e da Dança",
+        "Museu Nacional de Arte Antiga",
+        "Museu Nacional do Azulejo",
+        # Kept as provided, but note: "MIM" is also used for Brussels; verify the intended Lisbon venue name if needed.
+        "Musical Instruments Museum (MIM)",
+    ],
+}
+
 
 def _stable_index(key: str, modulo: int) -> int:
     if modulo <= 0:
@@ -116,16 +432,22 @@ def _pick_required_short_opener(
 def _pick_required_long_prefix(
     *, venue: str, seed: str, used: dict[str, int] | None = None
 ) -> str:
+    # Always render venue as "The <Venue>" in the forced first sentence of long English copy.
     templates = _TEMP_LONG_OPENING_PREFIX_TEMPLATES
+    venue_for_copy = _with_title_the_for_copy(venue)
     base = _stable_index(seed, len(templates))
     if not used:
-        return templates[base].format(venue=venue).strip()
+        return templates[base].format(venue=venue_for_copy).strip()
     for offset in range(len(templates)):
-        cand = templates[(base + offset) % len(templates)].format(venue=venue).strip()
+        cand = (
+            templates[(base + offset) % len(templates)]
+            .format(venue=venue_for_copy)
+            .strip()
+        )
         if used.get(cand, 0) == 0:
             used[cand] = 1
             return cand
-    cand = templates[base].format(venue=venue).strip()
+    cand = templates[base].format(venue=venue_for_copy).strip()
     used[cand] = used.get(cand, 0) + 1
     return cand
 
@@ -310,6 +632,8 @@ def _normalise_opening_hours(value: str) -> str:
     raw = str(value).strip()
     if not raw:
         return ""
+    if raw.lower() == _VENUE_OPENING_INFO_FALLBACK.lower():
+        return _VENUE_OPENING_INFO_FALLBACK
 
     # Fast path for already-normal strings (strip whitespace only).
     raw = re.sub(r"\s+", "", raw)
@@ -361,6 +685,230 @@ def _normalise_coord(value) -> str:
             except Exception:
                 return ""
     return ""
+
+
+def _parse_coord_pair(lat_value, lon_value) -> tuple[str, str] | None:
+    lat = _normalise_coord(lat_value)
+    lon = _normalise_coord(lon_value)
+    if not lat or not lon:
+        return None
+    return lat, lon
+
+
+def _dedupe_exhibition_key(item: dict) -> str:
+    """
+    Stable identity key for deduping the same exhibition found across multiple searches/passes.
+
+    IMPORTANT: Do NOT include `source_url` or `address` in the key since the same exhibition can
+    appear with different URLs (EN/FR pages) or address formatting. Including those leads to
+    duplicates leaking through into the final output.
+    """
+    venue = str(item.get("venue") or "").strip()
+    label = str(item.get("name") or "").strip()
+    title = label
+    low = label.lower()
+    marker = ", exhibition,"
+    if marker in low:
+        idx = low.find(marker)
+        title = label[:idx].strip()
+    start_raw = str(item.get("start_date") or "").strip()
+    end_raw = str(item.get("end_date") or "").strip()
+    s = _parse_date(start_raw)
+    e = _parse_date(end_raw) if end_raw else None
+    start_iso = s.isoformat() if s else start_raw
+    end_iso = (e.isoformat() if e else end_raw) or start_iso
+    return _normalise_for_dedupe("|".join([venue, title, start_iso, end_iso]))
+
+
+def _score_exhibition_item(item: dict) -> int:
+    score = 0
+    if (item.get("source_url") or "").strip():
+        score += 5
+    addr = (item.get("address") or "").strip()
+    if len(addr) >= 20:
+        score += 2
+    if _parse_coord_pair(item.get("latitude"), item.get("longitude")):
+        score += 2
+    if (item.get("information") or "").strip():
+        score += 1
+    open_days = (item.get("open_days") or "").strip()
+    opening_hours = (item.get("opening_hours") or "").strip()
+    if open_days and open_days != _VENUE_OPENING_INFO_FALLBACK:
+        score += 1
+    if opening_hours and opening_hours != _VENUE_OPENING_INFO_FALLBACK:
+        score += 1
+    return score
+
+
+def _merge_exhibition_items_keep_best(existing: dict, candidate: dict) -> dict:
+    """
+    Prefer the higher-quality record and fill missing fields from the other.
+    """
+    a = existing or {}
+    b = candidate or {}
+    sa = _score_exhibition_item(a)
+    sb = _score_exhibition_item(b)
+    best, other = (b, a) if sb > sa else (a, b)
+    out = dict(best)
+    for k, v in other.items():
+        if k not in out or out.get(k) in ("", None):
+            out[k] = v
+    # Prefer longer, more specific address if both are present.
+    try:
+        if isinstance(a.get("address"), str) and isinstance(b.get("address"), str):
+            if len(b.get("address", "")) > len(out.get("address", "")):
+                out["address"] = b.get("address", "")
+    except Exception:
+        pass
+    return out
+
+
+async def _lookup_venue_coords_async(
+    *,
+    client: AsyncOpenAI,
+    venue: str,
+    address: str,
+    city: str,
+    country: str,
+    use_web_search_tool: bool,
+) -> tuple[str, str, str] | None:
+    """
+    Best-effort coordinate lookup for a venue when the main search returns missing/invalid coords.
+    Returns: (latitude, longitude, source_url).
+    """
+    raw_key = "|".join([venue or "", address or "", city or "", country or ""])
+    key = _normalise_for_dedupe(raw_key)
+    if key and key in _TEMP_VENUE_COORD_CACHE:
+        return _TEMP_VENUE_COORD_CACHE.get(key)
+
+    tools = [{"type": "web_search"}] if use_web_search_tool else None
+    prompt = (
+        "Find the latitude/longitude for this venue (museum/gallery) in the given city.\n"
+        "Return ONLY JSON with keys: latitude, longitude, source_url.\n"
+        "- latitude/longitude must be decimals.\n"
+        "- source_url must be the page you used to verify the coordinates (official site or a reliable map listing).\n"
+        "- If you cannot verify reliably, return empty strings.\n\n"
+        f"Venue: {venue}\n"
+        f"Address: {address}\n"
+        f"City: {city}\n"
+        f"Country: {country}\n"
+    )
+    try:
+        resp = await _call_with_backoff(
+            lambda: client.responses.create(
+                model=TEMP_SEARCH_MODEL,
+                input=prompt,
+                tools=tools,
+                max_output_tokens=600,
+            ),
+            max_attempts=3,
+        )
+        content = _clean_json_content(resp.output_text or _extract_response_text(resp) or "")
+        data = _extract_json_object(content) if content else None
+        if not isinstance(data, dict):
+            return None
+        lat_lon = _parse_coord_pair(data.get("latitude"), data.get("longitude"))
+        if not lat_lon:
+            return None
+        src = str(data.get("source_url") or "").strip()
+        out = (lat_lon[0], lat_lon[1], src)
+        if key:
+            _TEMP_VENUE_COORD_CACHE[key] = out
+        return out
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "temp_venue_coord_lookup_error venue=%s city=%s country=%s err=%r",
+            venue,
+            city,
+            country,
+            exc,
+        )
+        return None
+
+
+async def _lookup_venue_opening_info_async(
+    *,
+    client: AsyncOpenAI,
+    venue: str,
+    address: str,
+    city: str,
+    country: str,
+    website_url: str,
+    use_web_search_tool: bool,
+) -> dict[str, str] | None:
+    """
+    Best-effort opening hours/open days lookup for a venue.
+    Returns: {opening_hours, open_days, source_url}
+    Values may be the fallback string if not verifiable.
+    """
+    raw_key = "|".join(
+        [venue or "", address or "", city or "", country or "", website_url or ""]
+    )
+    key = _normalise_for_dedupe(raw_key)
+    if key and key in _TEMP_VENUE_HOURS_CACHE:
+        return _TEMP_VENUE_HOURS_CACHE.get(key)
+
+    tools = [{"type": "web_search"}] if use_web_search_tool else None
+    prompt = (
+        "Find the venue opening hours and open days for this museum/gallery.\n"
+        "Return ONLY JSON with keys: opening_hours, open_days, source_url.\n"
+        "- opening_hours must be in this exact format (no spaces):\n"
+        "  Mon:12:00-14:00,Wed:08:00-12:00,Fri:14:00-18:00\n"
+        "  Use 24-hour time with leading zeros; omit closed days.\n"
+        "  If multiple intervals per day, use '/': Mon:10:00-13:00/14:00-18:00\n"
+        "- open_days must be comma-separated weekdays when open (e.g. Tue,Wed,Thu,Fri,Sat,Sun).\n"
+        "- Use the venue’s official hours/practical-information page when possible.\n"
+        f"- If you cannot verify reliably, set opening_hours to '{_VENUE_OPENING_INFO_FALLBACK}' and open_days to '{_VENUE_OPENING_INFO_FALLBACK}'. Do not guess.\n\n"
+        f"Venue: {venue}\n"
+        f"Address: {address}\n"
+        f"City: {city}\n"
+        f"Country: {country}\n"
+        f"Official website (if known): {website_url}\n"
+    )
+    try:
+        resp = await _call_with_backoff(
+            lambda: client.responses.create(
+                model=TEMP_SEARCH_MODEL,
+                input=prompt,
+                tools=tools,
+                max_output_tokens=900,
+            ),
+            max_attempts=3,
+        )
+        content = _clean_json_content(resp.output_text or _extract_response_text(resp) or "")
+        data = _extract_json_object(content) if content else None
+        if not isinstance(data, dict):
+            return None
+        opening_raw = str(data.get("opening_hours") or "").strip()
+        open_days_raw = str(data.get("open_days") or "").strip()
+        src = str(data.get("source_url") or "").strip()
+
+        opening_norm = _normalise_opening_hours(opening_raw) if opening_raw else ""
+        opening_out = opening_norm or opening_raw
+        open_days_out = open_days_raw
+
+        if not opening_out:
+            opening_out = _VENUE_OPENING_INFO_FALLBACK
+        if not open_days_out:
+            open_days_out = _VENUE_OPENING_INFO_FALLBACK
+
+        out = {
+            "opening_hours": opening_out,
+            "open_days": open_days_out,
+            "source_url": src,
+        }
+        if key:
+            _TEMP_VENUE_HOURS_CACHE[key] = out
+        return out
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "temp_venue_hours_lookup_error venue=%s city=%s country=%s err=%r",
+            venue,
+            city,
+            country,
+            exc,
+        )
+        return None
 
 
 def _normalise_duration_hours(value) -> str:
@@ -418,6 +966,36 @@ def _normalise_city_name(name: str) -> str:
     else:
         token = parts[0]
     return re.sub(r"\s+", " ", token).strip().lower()
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for v in values:
+        key = _normalise_for_dedupe(v or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(v)
+    return out
+
+
+def _with_title_the_for_copy(name: str) -> str:
+    """
+    For English copy only: render venues as "The <Name>" (capital T).
+    Avoid double-articles like "The the ...", and strip common non-English articles.
+    """
+    raw = (name or "").strip()
+    if not raw:
+        return "The venue"
+    lowered = raw.lower()
+    for prefix in ("the ", "le ", "la ", "les ", "l'", "l’"):
+        if lowered.startswith(prefix):
+            raw = raw[len(prefix) :].lstrip()
+            break
+    if raw.lower().startswith("the "):
+        raw = raw[4:].lstrip()
+    return f"The {raw}".strip()
 
 
 def _clean_json_content(text: str) -> str:
@@ -713,8 +1291,15 @@ def _maybe_prefix_the_venue(venue: str, country: str) -> str:
         return v
     if v.lower().startswith("the "):
         return v
+    # Avoid awkward double-articles for venues that already include a leading French article.
+    if re.match(r"^(le|la|les)\s+", v, flags=re.I) or v.lower().startswith(("l'", "l’")):
+        return v
     # Only apply to venue types where English convention typically uses "the".
-    if re.search(r"\b(museum|foundation|fondation|gallery|centre|center)\b", v, flags=re.I):
+    if re.search(
+        r"\b(museum|mus[eé]e|foundation|fondation|gallery|centre|center|palais|palace|institute|institut|collection)\b",
+        v,
+        flags=re.I,
+    ):
         return f"the {v}"
     return v
 
@@ -728,8 +1313,12 @@ def _extract_meta_image_url(html: str) -> str:
         return ""
     # Keep this lightweight (regex) and tolerant of attribute ordering/quotes.
     patterns = [
+        r'<meta[^>]+property=["\']og:image:secure_url["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image:secure_url["\']',
         r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
         r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+        r'<meta[^>]+name=["\']twitter:image:src["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image:src["\']',
         r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
         r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']',
     ]
@@ -738,6 +1327,129 @@ def _extract_meta_image_url(html: str) -> str:
         if m:
             return (m.group(1) or "").strip()
     return ""
+
+
+def _normalise_http_url(url: str, *, base_url: str = "") -> str:
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if u.startswith("data:"):
+        return ""
+    if u.startswith("//"):
+        # scheme-relative
+        try:
+            scheme = urlparse(base_url).scheme or "https"
+        except Exception:
+            scheme = "https"
+        u = f"{scheme}:{u}"
+    if base_url:
+        try:
+            u = urljoin(base_url, u)
+        except Exception:
+            pass
+    try:
+        p = urlparse(u)
+        if p.scheme not in ("http", "https") or not p.netloc:
+            return ""
+    except Exception:
+        return ""
+    return u
+
+
+def _extract_icon_url(html: str) -> str:
+    if not html:
+        return ""
+    patterns = [
+        r'<link[^>]+rel=["\'](?:shortcut\s+icon|icon)["\'][^>]+href=["\']([^"\']+)["\']',
+        r'<link[^>]+href=["\']([^"\']+)["\'][^>]+rel=["\'](?:shortcut\s+icon|icon)["\']',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html, flags=re.IGNORECASE)
+        if m:
+            return (m.group(1) or "").strip()
+    return ""
+
+
+def _domain_from_url(url: str) -> str:
+    try:
+        return urlparse(url).netloc or ""
+    except Exception:
+        return ""
+
+
+def _google_favicon_url(domain: str, *, size: int) -> str:
+    d = (domain or "").strip()
+    if not d:
+        return ""
+    # Returns an image for most domains; used as last-resort to guarantee non-empty URLs.
+    return f"https://www.google.com/s2/favicons?domain={d}&sz={size}"
+
+
+async def _discover_venues_async(
+    *,
+    client: AsyncOpenAI,
+    city: str,
+    country: str,
+    use_web_search_tool: bool,
+    max_venues: int,
+) -> list[dict[str, str]]:
+    """
+    Return a list of candidate venues for a city to seed deeper exhibition discovery.
+    Each item: {"venue": str, "website_url": str}.
+    """
+    key = _normalise_for_dedupe("|".join([city, country, str(max_venues)]))
+    if key and key in _TEMP_VENUE_DISCOVERY_CACHE:
+        return _TEMP_VENUE_DISCOVERY_CACHE.get(key, [])
+
+    tools = [{"type": "web_search"}] if use_web_search_tool else None
+    prompt = (
+        "List museums/galleries/venues in the given city that host temporary exhibitions.\n"
+        "Return ONLY a raw JSON array (no prose, no code fences).\n"
+        "Each element must be an object with keys: venue, website_url.\n"
+        "- Prefer major museums, contemporary art centres, photography spaces, foundations, and university museums.\n"
+        "- website_url should be the official venue website homepage when possible; otherwise empty string.\n"
+        f"- Return up to {max_venues} venues.\n"
+        "- Do not include duplicate venues.\n\n"
+        f"City: {city}\n"
+        f"Country: {country}\n"
+    )
+    try:
+        resp = await _call_with_backoff(
+            lambda: client.responses.create(
+                model=TEMP_SEARCH_MODEL,
+                input=prompt,
+                tools=tools,
+                max_output_tokens=6000,
+            ),
+            max_attempts=3,
+        )
+        content = _clean_json_content(resp.output_text or _extract_response_text(resp) or "")
+        arr = _extract_json_array(content) if content else None
+        if not isinstance(arr, list):
+            return []
+        out: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for item in arr:
+            if not isinstance(item, dict):
+                continue
+            v = str(item.get("venue") or "").strip()
+            u = str(item.get("website_url") or "").strip()
+            if not v:
+                continue
+            u = _normalise_http_url(u)
+            dedupe_key = _normalise_for_dedupe(v) or _domain_from_url(u)
+            if not dedupe_key or dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            out.append({"venue": v, "website_url": u})
+            if len(out) >= max_venues:
+                break
+        if key:
+            _TEMP_VENUE_DISCOVERY_CACHE[key] = out
+        return out
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("temp_venue_discovery_error city=%s country=%s err=%r", city, country, exc)
+        return []
 
 
 def _fetch_url_text(url: str, *, timeout_s: int = 20) -> str:
@@ -787,13 +1499,29 @@ async def _get_venue_image_url_async(
 
     # 1) Exhibition page
     html = await asyncio.to_thread(_fetch_url_text, source_url)
-    img = _extract_meta_image_url(html)
+    img = _normalise_http_url(_extract_meta_image_url(html), base_url=source_url)
+    if not img:
+        icon = _normalise_http_url(_extract_icon_url(html), base_url=source_url)
+        if icon:
+            img = icon
     if not img and homepage:
         # 2) Venue homepage
         html_home = await asyncio.to_thread(_fetch_url_text, homepage)
-        img = _extract_meta_image_url(html_home)
+        img = _normalise_http_url(_extract_meta_image_url(html_home), base_url=homepage)
+        if not img:
+            icon = _normalise_http_url(_extract_icon_url(html_home), base_url=homepage)
+            if icon:
+                img = icon
 
-    # 3) OpenAI fallback (optional; only if we have a client).
+    # 3) Domain favicon fallback (cheap, usually available).
+    if not img:
+        domain = _domain_from_url(homepage or source_url)
+        if domain:
+            img = _google_favicon_url(
+                domain, size=int(getattr(settings, "TEMP_IMAGE_FAVICON_SIZE", 256) or 256)
+            )
+
+    # 4) OpenAI fallback (optional; only if we have a client).
     if not img:
         client = _get_openai_client()
         if client is not None:
@@ -814,8 +1542,6 @@ async def _get_venue_image_url_async(
                         model=TEMP_SEARCH_MODEL,
                         input=prompt,
                         tools=tools,
-                        reasoning={"effort": "medium"},
-                        text={"format": {"type": "json_object"}},
                         max_output_tokens=500,
                     ),
                     max_attempts=3,
@@ -825,9 +1551,28 @@ async def _get_venue_image_url_async(
                 )
                 data = _extract_json_object(content) if content else None
                 if isinstance(data, dict):
-                    img = str(data.get("image_url") or "").strip()
-            except Exception:
+                    img = _normalise_http_url(str(data.get("image_url") or ""), base_url="")
+                    page = _normalise_http_url(str(data.get("page_url") or ""), base_url="")
+                    if not img and page:
+                        html_page = await asyncio.to_thread(_fetch_url_text, page)
+                        img = _normalise_http_url(_extract_meta_image_url(html_page), base_url=page)
+                        if not img:
+                            icon = _normalise_http_url(_extract_icon_url(html_page), base_url=page)
+                            if icon:
+                                img = icon
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "temp_venue_image_search_error venue=%s city=%s country=%s err=%r",
+                    venue,
+                    city,
+                    country,
+                    exc,
+                )
                 img = ""
+
+    # 5) Final fallback: always return a non-empty URL.
+    if not img:
+        img = str(getattr(settings, "TEMP_IMAGE_FALLBACK_URL", "") or "").strip()
 
     if cache_key:
         _TEMP_VENUE_IMAGE_CACHE[cache_key] = img or ""
@@ -876,11 +1621,12 @@ def _generate_temp_copy(
         else ""
     )
 
+    venue_for_copy = _with_title_the_for_copy(venue)
     base_prompt = (
         "Write copy for a Divento temporary exhibition listing.\n\n"
         "INPUTS\n"
         f"- Title: {title}\n"
-        f"- Venue: {venue}\n"
+        f"- Venue: {venue_for_copy}\n"
         f"- City: {city}\n"
         f"- Country: {country}\n"
         "\n"
@@ -894,7 +1640,8 @@ def _generate_temp_copy(
         "- Do not mention the exhibition dates anywhere.\n"
         "- Do not mention the visit duration/time-to-spend anywhere.\n"
         "- Spell out numbers one to ten in words (no digits 1–10).\n"
-        "- Do not include the venue’s postal address (no street, postcode, or 'address is …').\n\n"
+        "- Do not include the venue’s postal address (no street, postcode, or 'address is …').\n"
+        f"- When mentioning the venue name in the copy, always write it with a leading 'The' (capital T), matching: {venue_for_copy}.\n\n"
         "LONG (HTML)\n"
         "- 350 to 400 words. Target 380–395 words.\n"
         "- If you are under 350 words, add one more factual sentence to reach the minimum.\n"
@@ -1410,35 +2157,99 @@ async def _fetch_temporary_exhibitions_window_async(
             + "\n- ".join(venue_hints[:16])
             + "\n\n"
         )
-    if target_max <= 0:
-        select_clause = (
-            "- Return as many distinct exhibitions as you can find for this window (no duplicates). "
-            "Search deeply across multiple venues/sources.\n\n"
+
+    # We always push hard for a full result set. If no explicit cap is provided (target_max<=0),
+    # we still enforce a hard safety cap.
+    hard_max = max(1, int(getattr(settings, "TEMP_HARD_MAX_EXHIBITIONS", 200) or 200))
+    pass_max = max(5, int(getattr(settings, "TEMP_SEARCH_PASS_MAX_ITEMS", 60) or 60))
+    desired_max = int(target_max) if int(target_max) > 0 else hard_max
+    desired_min = min(int(getattr(settings, "TEMP_TARGET_MIN_EXHIBITIONS", 15) or 15), desired_max)
+    passes = max(1, int(getattr(settings, "TEMP_SEARCH_PASSES", 3) or 3))
+    venue_deepen_passes = max(
+        0, int(getattr(settings, "TEMP_VENUE_DEEPEN_PASSES", 1) or 1)
+    )
+    venue_deepen_max_venues = int(getattr(settings, "TEMP_VENUE_DEEPEN_MAX_VENUES", 12) or 0)
+    venue_deepen_max_per_venue = max(
+        1, int(getattr(settings, "TEMP_VENUE_DEEPEN_MAX_PER_VENUE", 3) or 3)
+    )
+    geo_conc = max(1, int(getattr(settings, "TEMP_GEO_CONCURRENCY", 4) or 4))
+    venue_discovery_enabled = int(getattr(settings, "TEMP_VENUE_DISCOVERY_ENABLED", 1) or 0) != 0
+    venue_discovery_max = int(getattr(settings, "TEMP_VENUE_DISCOVERY_MAX", 50) or 0)
+
+    venue_discovery_block = ""
+    discovered_venues: list[dict[str, str]] = []
+    if venue_discovery_enabled and venue_discovery_max > 0:
+        discovered_venues = await _discover_venues_async(
+            client=client,
+            city=city,
+            country="",
+            use_web_search_tool=use_web_search_tool,
+            max_venues=venue_discovery_max,
         )
-    elif target_max == 1:
+        if discovered_venues:
+            lines: list[str] = []
+            for it in discovered_venues[: min(venue_discovery_max, 60)]:
+                v = (it.get("venue") or "").strip()
+                u = (it.get("website_url") or "").strip()
+                if not v:
+                    continue
+                if u:
+                    lines.append(f"{v} ({u})")
+                else:
+                    lines.append(v)
+            if lines:
+                venue_discovery_block = (
+                    "Venue discovery seed list (use these to broaden coverage and then find temporary exhibitions at each venue):\n- "
+                    + "\n- ".join(lines)
+                    + "\n\n"
+                )
+
+    curated_enabled = int(getattr(settings, "TEMP_CURATED_VENUES_ENABLED", 1) or 0) != 0
+    curated_max_venues = int(getattr(settings, "TEMP_CURATED_VENUES_MAX_VENUES", 0) or 0)
+    curated_max_items_per_venue = max(
+        1, int(getattr(settings, "TEMP_CURATED_VENUES_MAX_ITEMS_PER_VENUE", 8) or 8)
+    )
+    curated_venues = _dedupe_preserve_order(_CITY_CURATED_VENUES.get(city_norm, []))
+    if curated_max_venues > 0:
+        curated_venues = curated_venues[:curated_max_venues]
+
+    curated_block = ""
+    if curated_enabled and curated_venues:
+        curated_block = (
+            "Priority venue list (MUST attempt to find temporary exhibitions at each venue below, then expand beyond this list):\n- "
+            + "\n- ".join(curated_venues)
+            + "\n\n"
+        )
+
+    if desired_max == 1:
         select_clause = "- Return exactly 1 distinct exhibition (no duplicates).\n\n"
+    elif int(target_max) <= 0:
+        select_clause = (
+            f"- Return as many distinct exhibitions as you can find (aim for a lot), up to {pass_max} items in this response.\n"
+            "- No duplicates.\n\n"
+        )
     else:
         select_clause = (
-            "- Return as many exhibitions as you can find for this window: it is VERY IMPORTANT to reach 15 to 20 "
-            "distinct exhibitions. Search deeply across multiple museums and venues/sources, keep count, and keep adding until you "
-            "hit the maximum or truly run out. No duplicates.\n\n"
+            f"- Return as many exhibitions as you can find for this window: it is VERY IMPORTANT to reach {desired_min} to {desired_max} "
+            "distinct exhibitions. Search deeply, keep count, and keep adding until you hit the maximum or truly run out. "
+            "No duplicates.\n\n"
         )
     tool_line = "- Use the web_search tool.\n" if use_web_search_tool else ""
     evidence_lines = (
         "- Use web_search to find real pages.\n"
         "- Do not invent exhibitions, dates, venues, addresses, or opening hours.\n"
-        "- If you cannot reliably find a specific field, return an empty string for that field (except dates).\n"
+        "- If you cannot reliably find a specific field, return an empty string for that field (except dates and venue opening info).\n"
         "- Dates (start_date/end_date) should match what you find on the web; do not guess.\n"
-        "- Opening hours should come from the venue’s official hours page when possible; if not verified, return opening_hours as an empty string.\n"
+        f"- Opening info should come from the venue’s official hours page when possible; if not verified, set opening_hours and open_days to '{_VENUE_OPENING_INFO_FALLBACK}'.\n"
     )
     if not use_web_search_tool:
         evidence_lines = (
             "- Use web sources (the model’s built-in browsing/search) to verify every field.\n"
             "- Dates (start_date/end_date) MUST match what you find on the web; do not guess.\n"
-            "- Opening hours MUST be taken from the venue’s official hours page or a reliable source; if not verified, return opening_hours as an empty string.\n"
+            f"- Opening hours MUST be taken from the venue’s official hours page or a reliable source; if not verified, set opening_hours and open_days to '{_VENUE_OPENING_INFO_FALLBACK}'.\n"
             "- If you cannot reliably find a specific field, return an empty string for that field.\n"
         )
-    prompt = (
+    base_prompt = (
         "I need to create new exhibitions for Divento.\n"
         "Please follow these steps exactly.\n\n"
         "IMPORTANT (anti-hallucination):\n"
@@ -1448,12 +2259,12 @@ async def _fetch_temporary_exhibitions_window_async(
         "Naming policy:\n"
         "- Prefer English-language official pages when available.\n"
         "- Return the exhibition title exactly as written on the source_url page you used; do not translate it.\n\n"
-        "Venue diversity requirement:\n"
-        "- Do NOT return results from only 2–4 venues.\n"
-        "- Aim to cover at least 8 distinct venues when possible.\n"
-        "- Until you have at least 8 venues, cap at 3 exhibitions per venue (keep searching other venues).\n"
-        "- If the city truly has fewer venues with temporary exhibitions in this window, return what you can verify.\n\n"
+        "Venue strategy:\n"
+        "- It is OK to return many exhibitions from the same venue if they are distinct and verifiable.\n"
+        "- Do not artificially cap the number of exhibitions per venue.\n\n"
         f"{venue_hint_block}"
+        f"{curated_block}"
+        f"{venue_discovery_block}"
         "1. Select exhibitions\n"
         f"- Assume today's date is {today_iso}.\n"
         f"- Do not include exhibitions that end before {soon_cutoff_iso} (ending within the next 30 days).\n"
@@ -1471,7 +2282,7 @@ async def _fetch_temporary_exhibitions_window_async(
         "- city: the city where the exhibition takes place.\n"
         "- country: the country for that city.\n"
         "- address: the full postal address of the venue.\n"
-        "- duration: suggested visit duration as free text (for example '1 hour' or '90 minutes').\n"
+        "- duration: suggested visit duration as free text (for example '1 hour' or '90 minutes'). If you cannot explicitly find/verify a duration, return exactly '1 hour' (do not guess smaller values).\n"
         "- start_date: exhibition start date in ISO format YYYY-MM-DD.\n"
         "- end_date: exhibition end date in ISO format YYYY-MM-DD.\n"
         "- venue: the name of the hosting museum or gallery.\n"
@@ -1483,17 +2294,19 @@ async def _fetch_temporary_exhibitions_window_async(
         "4. Additional info\n"
         "- information: one or two sentences of additional factual context or practical "
         "information about the exhibition, without marketing language.\n"
-        "- latitude and longitude: REQUIRED. Provide decimal coordinates for the venue based on reliable sources; do not leave blank. Use decimals (e.g. 48.8606, 2.3376).\n\n"
+        "- latitude and longitude: REQUIRED. Provide decimal coordinates for the venue based on reliable sources; do not leave blank.\n"
+        "- If coordinates are not on the venue page, use a reliable map listing to verify them.\n\n"
         "5. Opening pattern\n"
         "- repeat_pattern: 'daily' or 'weekly' based on how the exhibition runs.\n"
-        "- open_days: comma-separated weekdays when open (e.g. Tue,Wed,Thu,Fri,Sat,Sun). If open daily, return Mon,Tue,Wed,Thu,Fri,Sat,Sun.\n\n"
+        "- open_days: comma-separated weekdays when open (e.g. Tue,Wed,Thu,Fri,Sat,Sun). If open daily, return Mon,Tue,Wed,Thu,Fri,Sat,Sun.\n"
+        f"  If open days cannot be verified reliably, return '{_VENUE_OPENING_INFO_FALLBACK}'.\n\n"
         "6. Venue opening hours (required)\n"
         "- opening_hours: venue opening hours in this exact format (no spaces):\n"
         "  Mon:12:00-14:00,Wed:08:00-12:00,Fri:14:00-18:00\n"
         "  Use 24-hour time with leading zeros; omit days the venue is closed.\n"
         "  If the venue has multiple intervals in a day, use '/' inside that day:\n"
         "  Mon:10:00-13:00/14:00-18:00\n"
-        "  If hours cannot be verified reliably, return an empty string.\n\n"
+        f"  If hours cannot be verified reliably, return '{_VENUE_OPENING_INFO_FALLBACK}'.\n\n"
         "Do not include image URLs or legends.\n\n"
         "Return ONLY a raw JSON array and nothing else (no code fences, no prose). If you find no exhibitions, return an empty JSON array [].\n"
         "The top-level value must be a JSON array. Each element must "
@@ -1503,87 +2316,402 @@ async def _fetch_temporary_exhibitions_window_async(
     )
 
     try:
-        content = ""
-        try:
-            tools_arg = [{"type": "web_search"}] if use_web_search_tool else None
-            resp = await _call_with_backoff(
-                lambda: client.responses.create(
-                    model=TEMP_SEARCH_MODEL,
-                    input=prompt,
-                    tools=tools_arg,
-                    max_output_tokens=12000,
-                )
-            )
-            content = _clean_json_content(
-                resp.output_text or _extract_response_text(resp) or ""
-            )
-        except Exception as exc_resp:  # noqa: BLE001
-            print("DEBUG Responses API error:", repr(exc_resp))
-            logger.debug("temp_search_responses_error city=%s err=%r", city, exc_resp)
-            content = ""
+        tools_arg = [{"type": "web_search"}] if use_web_search_tool else None
 
-        async def _responses_retry() -> str:
+        def _kept_estimate_count(items: list[dict]) -> int:
+            """
+            Estimate how many items will survive the hard filters, so we don't stop searching too early.
+            Rules:
+            - Exclude exhibitions that close before window_start OR open after window_end.
+            - Exclude exhibitions that end within 30 days of window_start.
+            """
+            n = 0
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                s_raw = (it.get("start_date") or "").strip()
+                e_raw = (it.get("end_date") or "").strip()
+                s_date = _parse_date(s_raw)
+                e_date = _parse_date(e_raw) if e_raw else None
+                if s_date and s_date > window_end:
+                    continue
+                if e_date and e_date < window_start:
+                    continue
+                if e_date and e_date < soon_cutoff:
+                    continue
+                n += 1
+            return n
+
+        async def _run_search(input_prompt: str) -> str:
             try:
-                tools_arg = [{"type": "web_search"}] if use_web_search_tool else None
-                resp_retry = await _call_with_backoff(
+                resp = await _call_with_backoff(
                     lambda: client.responses.create(
                         model=TEMP_SEARCH_MODEL,
-                        input=prompt,
+                        input=input_prompt,
                         tools=tools_arg,
                         max_output_tokens=12000,
                     )
                 )
                 return _clean_json_content(
-                    resp_retry.output_text or _extract_response_text(resp_retry) or ""
+                    resp.output_text or _extract_response_text(resp) or ""
                 )
-            except Exception as exc_retry:  # noqa: BLE001
-                print("DEBUG Responses API retry error:", repr(exc_retry))
-                logger.debug(
-                    "temp_search_responses_retry_error city=%s err=%r", city, exc_retry
-                )
+            except Exception as exc_resp:  # noqa: BLE001
+                logger.debug("temp_search_responses_error city=%s err=%r", city, exc_resp)
                 return ""
 
-        if not content or content.strip() in ("[]", ""):
-            content = await _responses_retry()
+        async def _run_search_with_retries(input_prompt: str) -> str:
+            content = await _run_search(input_prompt)
+            if not content or content.strip() in ("[]", ""):
+                content = await _run_search(input_prompt)
+            if content.strip() in ("[]", ""):
+                content = await _run_search(input_prompt)
+            return content
 
-        if content.strip() in ("[]", ""):
-            content = await _responses_retry()
+        combined: list[dict] = []
+        seen: set[str] = set()
+        last_raw = ""
+        # Allow a larger pool than the final desired count because we may drop some items
+        # (e.g. exhibitions ending within the next 30 days).
+        if int(target_max) <= 0:
+            pool_max = min(hard_max, (passes * pass_max) + 20)
+        else:
+            pool_max = max(desired_max * 2, desired_max + 10)
 
-        print("DEBUG _fetch_temporary_exhibitions_window raw content:", content[:500])
-        logger.debug(
-            "temp_search_raw city=%s chars=%s snippet=%r",
+        logger.info(
+            "temp_search_plan city=%s passes=%s target_min=%s target_max=%s pool_max=%s venue_deepen_passes=%s venue_deepen_max_venues=%s venue_deepen_max_per_venue=%s venue_discovery_enabled=%s",
             city,
-            len(content or ""),
-            (content or "")[:1200],
+            passes,
+            desired_min,
+            desired_max,
+            pool_max,
+            venue_deepen_passes,
+            venue_deepen_max_venues,
+            venue_deepen_max_per_venue,
+            venue_discovery_enabled,
         )
-        if not content or content.strip() in ("[]", ""):
-            print("DEBUG _fetch_temporary_exhibitions_window parsed items: 0 (empty)")
-            logger.debug(
-                "temp_search_empty city=%s raw=%r", city, (content or "")[:2000]
+
+        # Phase 0: curated venue list. Query each venue directly to ensure coverage.
+        if curated_enabled and curated_venues and len(combined) < pool_max:
+            logger.info(
+                "temp_search_curated_plan city=%s venues=%s max_items_per_venue=%s",
+                city,
+                len(curated_venues),
+                curated_max_items_per_venue,
             )
+            for venue_name in curated_venues:
+                if len(combined) >= pool_max:
+                    break
+                before_total = len(combined)
+                before_kept = _kept_estimate_count(combined)
+                existing_for_venue = [
+                    f"{(it.get('name') or '').strip()} | {(it.get('start_date') or '').strip()} | {(it.get('end_date') or '').strip()}"
+                    for it in combined
+                    if (it.get("venue") or "").strip().lower() == venue_name.lower()
+                ][:30]
+                curated_prompt = (
+                    base_prompt
+                    + "\n\nPriority step: curated venue coverage.\n"
+                    + f"- Focus ONLY on venue: {venue_name} in {city}.\n"
+                    + f"- Find as many distinct temporary exhibitions at this venue within the same date window as you can, up to {curated_max_items_per_venue} items.\n"
+                    + "- Do not repeat any exhibitions listed below.\n"
+                    + "\nAlready found for this venue (exclude these):\n- "
+                    + "\n- ".join(existing_for_venue or ["(none)"])
+                    + "\n\nReturn ONLY a raw JSON array.\n"
+                )
+                content = await _run_search_with_retries(curated_prompt)
+                if not content or content.strip() in ("[]", ""):
+                    logger.info(
+                        "temp_search_curated city=%s venue=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
+                        city,
+                        venue_name,
+                        0,
+                        0,
+                        len(combined),
+                        _kept_estimate_count(combined),
+                        "empty",
+                    )
+                    continue
+                data = _extract_json_array(content)
+                if data is None:
+                    logger.info(
+                        "temp_search_curated city=%s venue=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
+                        city,
+                        venue_name,
+                        0,
+                        0,
+                        len(combined),
+                        _kept_estimate_count(combined),
+                        "parse_failed",
+                    )
+                    continue
+                parsed_n = len(data) if isinstance(data, list) else 0
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    k = _dedupe_exhibition_key(item)
+                    if not k or k in seen:
+                        continue
+                    seen.add(k)
+                    combined.append(item)
+                    if len(combined) >= pool_max:
+                        break
+                after_total = len(combined)
+                new_added = max(0, after_total - before_total)
+                logger.info(
+                    "temp_search_curated city=%s venue=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
+                    city,
+                    venue_name,
+                    parsed_n,
+                    new_added,
+                    after_total,
+                    _kept_estimate_count(combined),
+                    f"kept_before={before_kept}",
+                )
+
+        for pass_idx in range(passes):
+            before_total = len(combined)
+            before_kept = _kept_estimate_count(combined)
+            if pass_idx == 0 or not combined:
+                input_prompt = base_prompt
+            else:
+                exclude = []
+                for it in combined[:40]:
+                    exclude.append(
+                        f"{(it.get('venue') or '').strip()} | {(it.get('name') or '').strip()} | {(it.get('start_date') or '').strip()} | {(it.get('end_date') or '').strip()}"
+                    )
+                input_prompt = (
+                    base_prompt
+                    + "\n\nNow find MORE distinct exhibitions under the exact same rules.\n"
+                    + f"- You must add new exhibitions until you reach {desired_max} total, or truly run out.\n"
+                    + "- Do not repeat any exhibitions listed below.\n"
+                    + "\nAlready found (exclude these):\n- "
+                    + "\n- ".join(exclude)
+                    + "\n"
+                )
+
+            content = await _run_search_with_retries(input_prompt)
+            last_raw = content or ""
+            logger.debug(
+                "temp_search_raw city=%s pass=%s chars=%s snippet=%r",
+                city,
+                pass_idx + 1,
+                len(content or ""),
+                (content or "")[:1200],
+            )
+            if not content or content.strip() in ("[]", ""):
+                logger.info(
+                    "temp_search_pass city=%s pass=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
+                    city,
+                    pass_idx + 1,
+                    0,
+                    0,
+                    len(combined),
+                    _kept_estimate_count(combined),
+                    "empty",
+                )
+                continue
+
+            data = _extract_json_array(content)
+            if data is None:
+                logger.debug(
+                    "temp_search_parse_failed city=%s pass=%s raw=%r",
+                    city,
+                    pass_idx + 1,
+                    (content or "")[:2000],
+                )
+                logger.info(
+                    "temp_search_pass city=%s pass=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
+                    city,
+                    pass_idx + 1,
+                    0,
+                    0,
+                    len(combined),
+                    _kept_estimate_count(combined),
+                    "parse_failed",
+                )
+                continue
+
+            logger.debug("temp_search_parsed city=%s pass=%s items=%s", city, pass_idx + 1, len(data))
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                k = _dedupe_exhibition_key(item)
+                if not k or k in seen:
+                    continue
+                seen.add(k)
+                combined.append(item)
+                if len(combined) >= pool_max:
+                    break
+
+            kept_est = _kept_estimate_count(combined)
+            after_total = len(combined)
+            new_added = max(0, after_total - before_total)
+            logger.info(
+                "temp_search_pass city=%s pass=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
+                city,
+                pass_idx + 1,
+                len(data),
+                new_added,
+                after_total,
+                kept_est,
+                f"kept_before={before_kept}",
+            )
+            # If we're uncapped, always run all base passes and just respect the safety pool limit.
+            if int(target_max) > 0 and kept_est >= desired_max:
+                break
+            if len(combined) >= pool_max:
+                break
+
+        if not combined:
+            logger.debug("temp_search_empty city=%s raw=%r", city, last_raw[:2000])
             return []
 
-        data = _extract_json_array(content)
-        if data is None:
-            logger.debug(
-                "temp_search_parse_failed city=%s raw=%r", city, (content or "")[:2000]
-            )
-            content_retry = await _responses_retry()
-            if content_retry and content_retry.strip() not in ("[]", ""):
-                logger.debug(
-                    "temp_search_retry_raw city=%s chars=%s snippet=%r",
-                    city,
-                    len(content_retry or ""),
-                    (content_retry or "")[:1200],
-                )
-                data = _extract_json_array(content_retry)
-            if data is None:
-                logger.debug("temp_search_parse_failed_after_retry city=%s", city)
-                return []
+        # Per-venue deepening: query specific venues to extract additional temporary exhibitions.
+        if (
+            venue_deepen_passes > 0
+            and len(combined) < pool_max
+            and (int(target_max) > 0 and _kept_estimate_count(combined) < desired_max)
+        ):
+            venue_counts: dict[str, int] = {}
+            for it in combined:
+                v = (it.get("venue") or "").strip()
+                if not v:
+                    continue
+                venue_counts[v] = venue_counts.get(v, 0) + 1
 
-        logger.debug("temp_search_parsed city=%s items=%s", city, len(data))
+            venues_sorted = sorted(venue_counts.items(), key=lambda x: (-x[1], x[0].lower()))
+            venues = [v for v, _cnt in venues_sorted]
+
+            # Also deepen on discovered venues (even if not present in the first pass results).
+            for it in (discovered_venues or [])[: max(0, venue_discovery_max)]:
+                v = (it.get("venue") or "").strip()
+                if v and v not in venues:
+                    venues.append(v)
+            if venue_deepen_max_venues > 0:
+                venues = venues[:venue_deepen_max_venues]
+
+            for _pass in range(venue_deepen_passes):
+                if _kept_estimate_count(combined) >= desired_max:
+                    break
+                logger.info(
+                    "temp_search_deepen_pass city=%s pass=%s venues=%s kept_est=%s total=%s",
+                    city,
+                    _pass + 1,
+                    len(venues),
+                    _kept_estimate_count(combined),
+                    len(combined),
+                )
+                for venue_name in venues:
+                    if _kept_estimate_count(combined) >= desired_max:
+                        break
+                    before_total = len(combined)
+                    existing_for_venue = [
+                        f"{(it.get('name') or '').strip()} | {(it.get('start_date') or '').strip()} | {(it.get('end_date') or '').strip()}"
+                        for it in combined
+                        if (it.get("venue") or "").strip() == venue_name
+                    ][:20]
+                    deepen_prompt = (
+                        base_prompt
+                        + "\n\nExtra step: go deep for a single venue.\n"
+                        + f"- Focus ONLY on venue: {venue_name} in {city}.\n"
+                        + f"- Find up to {venue_deepen_max_per_venue} additional distinct temporary exhibitions at this venue within the same date window.\n"
+                        + "- Do not repeat any exhibitions listed below.\n"
+                        + "\nAlready found for this venue (exclude these):\n- "
+                        + "\n- ".join(existing_for_venue or ["(none)"])
+                        + "\n\nReturn ONLY a raw JSON array.\n"
+                    )
+                    content = await _run_search_with_retries(deepen_prompt)
+                    logger.debug(
+                        "temp_search_venue_raw city=%s venue=%s chars=%s snippet=%r",
+                        city,
+                        venue_name,
+                        len(content or ""),
+                        (content or "")[:600],
+                    )
+                    if not content or content.strip() in ("[]", ""):
+                        continue
+                    data = _extract_json_array(content)
+                    if data is None:
+                        logger.debug(
+                            "temp_search_venue_parse_failed city=%s venue=%s raw=%r",
+                            city,
+                            venue_name,
+                            (content or "")[:2000],
+                        )
+                        logger.info(
+                            "temp_search_deepen city=%s pass=%s venue=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
+                            city,
+                            _pass + 1,
+                            venue_name,
+                            0,
+                            0,
+                            len(combined),
+                            _kept_estimate_count(combined),
+                            "parse_failed",
+                        )
+                        continue
+                    parsed_n = len(data) if isinstance(data, list) else 0
+                    for item in data:
+                        if not isinstance(item, dict):
+                            continue
+                        k = _dedupe_exhibition_key(item)
+                        if not k or k in seen:
+                            continue
+                        seen.add(k)
+                        combined.append(item)
+                        if len(combined) >= pool_max:
+                            break
+                    after_total = len(combined)
+                    new_added = max(0, after_total - before_total)
+                    logger.info(
+                        "temp_search_deepen city=%s pass=%s venue=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
+                        city,
+                        _pass + 1,
+                        venue_name,
+                        parsed_n,
+                        new_added,
+                        after_total,
+                        _kept_estimate_count(combined),
+                        "",
+                    )
+
+        # Fill missing venue coordinates (best-effort) so missing coords don't reduce usable output.
+        missing = [
+            it
+            for it in combined
+            if not _parse_coord_pair(it.get("latitude"), it.get("longitude"))
+        ]
+        if missing:
+            sem = asyncio.Semaphore(geo_conc)
+
+            async def _fill_one(it: dict) -> None:
+                async with sem:
+                    looked = await _lookup_venue_coords_async(
+                        client=client,
+                        venue=(it.get("venue") or "").strip(),
+                        address=(it.get("address") or "").strip(),
+                        city=(it.get("city") or city).strip(),
+                        country=(it.get("country") or "").strip(),
+                        use_web_search_tool=use_web_search_tool,
+                    )
+                    if looked:
+                        it["latitude"] = looked[0]
+                        it["longitude"] = looked[1]
+
+            await asyncio.gather(*[_fill_one(it) for it in missing[: desired_max * 2]])
+
+        logger.debug("temp_search_combined city=%s items=%s", city, len(combined))
+
         filtered: list[dict] = []
-        for item in data:
+        # Best-effort backfill of venue opening info after the main search. We'll apply per-venue
+        # results across all exhibitions, and guarantee a non-empty string fallback at export time.
+        hours_backfill_enabled = (
+            int(getattr(settings, "TEMP_VENUE_HOURS_BACKFILL_ENABLED", 1) or 0) != 0
+        )
+        hours_backfill_conc = max(
+            1, int(getattr(settings, "TEMP_VENUE_HOURS_BACKFILL_CONCURRENCY", 4) or 4)
+        )
+        for item in combined:
             if not isinstance(item, dict):
                 continue
 
@@ -1601,7 +2729,12 @@ async def _fetch_temporary_exhibitions_window_async(
             elif s_date and not e_raw:
                 item["end_date"] = s_date.isoformat()
 
-            # Skip exhibitions ending soon (< 30 days from window_start).
+            # Exclude only: closes before window_start OR opens after window_end.
+            if s_date and s_date > window_end:
+                continue
+            if e_date and e_date < window_start:
+                continue
+            # Also exclude: ends within 30 days from window_start.
             if e_date and e_date < soon_cutoff:
                 continue
 
@@ -1613,9 +2746,9 @@ async def _fetch_temporary_exhibitions_window_async(
             item["address"] = _abbrev_country_in_address(
                 (item.get("address") or "").strip(), item["country"]
             )
-            item["opening_hours"] = _normalise_opening_hours(
-                (item.get("opening_hours") or "").strip()
-            )
+            opening_hours_raw = (item.get("opening_hours") or "").strip()
+            opening_norm = _normalise_opening_hours(opening_hours_raw)
+            item["opening_hours"] = opening_norm or opening_hours_raw
             item["repeat_pattern"] = (item.get("repeat_pattern") or "").strip()
             item["open_days"] = (item.get("open_days") or "").strip()
             item["information"] = (item.get("information") or "").strip()
@@ -1624,9 +2757,106 @@ async def _fetch_temporary_exhibitions_window_async(
             item["source_url"] = source_url
             filtered.append(item)
 
+        # Final dedupe after normalisation (important for multi-pass/curated phases).
+        # This removes cases where the same exhibition is returned with different `source_url`
+        # or slightly different address formatting.
+        if filtered:
+            by_key: dict[str, dict] = {}
+            for it in filtered:
+                k = _dedupe_exhibition_key(it)
+                if not k:
+                    continue
+                if k not in by_key:
+                    by_key[k] = it
+                else:
+                    by_key[k] = _merge_exhibition_items_keep_best(by_key[k], it)
+            if len(by_key) != len(filtered):
+                logger.info(
+                    "temp_search_deduped city=%s before=%s after=%s",
+                    city,
+                    len(filtered),
+                    len(by_key),
+                )
+            filtered = list(by_key.values())
+
+        if hours_backfill_enabled and filtered:
+            # Only look up venues that have missing opening info. Do this once per venue,
+            # then apply across all its exhibitions.
+            per_venue: dict[str, dict[str, str]] = {}
+            for it in filtered:
+                v = (it.get("venue") or "").strip()
+                if not v:
+                    continue
+                if v in per_venue:
+                    continue
+                od = (it.get("open_days") or "").strip()
+                oh = (it.get("opening_hours") or "").strip()
+                if od and oh:
+                    continue
+                per_venue[v] = {
+                    "venue": v,
+                    "address": (it.get("address") or "").strip(),
+                    "city": (it.get("city") or "").strip(),
+                    "country": (it.get("country") or "").strip(),
+                    "website_url": (it.get("source_url") or "").strip(),
+                }
+
+            if per_venue:
+                sem = asyncio.Semaphore(hours_backfill_conc)
+
+                async def _fill_venue(vinfo: dict[str, str]) -> tuple[str, dict[str, str]] | None:
+                    async with sem:
+                        got = await _lookup_venue_opening_info_async(
+                            client=client,
+                            venue=vinfo.get("venue") or "",
+                            address=vinfo.get("address") or "",
+                            city=vinfo.get("city") or "",
+                            country=vinfo.get("country") or "",
+                            website_url=vinfo.get("website_url") or "",
+                            use_web_search_tool=use_web_search_tool,
+                        )
+                        if not got:
+                            return None
+                        return (vinfo.get("venue") or "", got)
+
+                filled = await asyncio.gather(*[_fill_venue(v) for v in per_venue.values()])
+                filled_map: dict[str, dict[str, str]] = {}
+                for pair in filled:
+                    if not pair:
+                        continue
+                    name_key, got = pair
+                    if name_key:
+                        filled_map[name_key] = got
+
+                if filled_map:
+                    for it in filtered:
+                        v = (it.get("venue") or "").strip()
+                        got = filled_map.get(v)
+                        if not got:
+                            continue
+                        if not (it.get("opening_hours") or "").strip():
+                            it["opening_hours"] = got.get("opening_hours") or ""
+                        if not (it.get("open_days") or "").strip():
+                            it["open_days"] = got.get("open_days") or ""
+
+        # Derive open_days from opening_hours when possible (and not already set).
+        for it in filtered:
+            if (it.get("open_days") or "").strip():
+                continue
+            oh = (it.get("opening_hours") or "").strip()
+            oh_norm = _normalise_opening_hours(oh)
+            if not oh_norm or oh_norm == _VENUE_OPENING_INFO_FALLBACK:
+                continue
+            days = []
+            for part in oh_norm.split(","):
+                if ":" in part:
+                    days.append(part.split(":", 1)[0])
+            if days:
+                it["open_days"] = ",".join(days)
+
         logger.debug("temp_search_filtered city=%s kept=%s", city, len(filtered))
-        if target_max > 0 and len(filtered) > target_max:
-            filtered = filtered[:target_max]
+        if desired_max > 0 and len(filtered) > desired_max:
+            filtered = filtered[:desired_max]
         return filtered
     except Exception as exc:  # noqa: BLE001
         print("DEBUG _fetch_temporary_exhibitions_window OpenAI error:", repr(exc))
@@ -1760,9 +2990,12 @@ async def scrape_temporary_exhibitions_async(
         longitude = _normalise_coord(ex.get("longitude"))
         repeat_pattern = (ex.get("repeat_pattern") or "").strip()
         open_days = (ex.get("open_days") or "").strip()
-        opening_hours = _normalise_opening_hours(
-            (ex.get("opening_hours") or "").strip()
-        )
+        opening_hours_raw = (ex.get("opening_hours") or "").strip()
+        opening_hours = _normalise_opening_hours(opening_hours_raw) or opening_hours_raw
+        if not open_days:
+            open_days = _VENUE_OPENING_INFO_FALLBACK
+        if not opening_hours:
+            opening_hours = _VENUE_OPENING_INFO_FALLBACK
 
         venue = _maybe_prefix_the_venue(venue, country)
 
@@ -1831,7 +3064,7 @@ async def scrape_temporary_exhibitions_async(
         venue = _maybe_prefix_the_venue(venue, country)
 
         city_label = ex_city or city
-        cats = f"Top Exhibitions in {city_label}".strip()
+        cats = f"Top Exhibitions, Arts and Culture, Exhibitions in {city_label}".strip()
         name_head = (name.split(":", 1)[0] if name else "").strip()
         name_head = re.sub(r"\(.*?\)", "", name_head).strip()
         title_seed = name_head or venue or city_label
@@ -1873,7 +3106,7 @@ async def scrape_temporary_exhibitions_async(
         elif country and ex_city:
             venue_category_path = f"{country}, {ex_city}"
 
-        duration_val = _normalise_duration_hours(duration_raw) or "1.5"
+        duration_val = _normalise_duration_hours(duration_raw) or "1"
 
         row = {
             "Name of site, City": title,
@@ -1988,6 +3221,59 @@ async def scrape_temporary_exhibitions_async(
             continue
         if isinstance(res, dict) and res:
             rows.append(res)
+
+    # Final export-stage dedupe: protect against duplicates that slip through due to differing
+    # upstream fields but identical final titles.
+    if rows:
+        def _score_export_row(r: dict) -> int:
+            score = 0
+            if (r.get("URL of images") or "").strip():
+                score += 2
+            if (r.get("Opening and closing time") or "").strip() and (
+                (r.get("Opening and closing time") or "").strip() != _VENUE_OPENING_INFO_FALLBACK
+            ):
+                score += 2
+            if (r.get("Open days") or "").strip() and (
+                (r.get("Open days") or "").strip() != _VENUE_OPENING_INFO_FALLBACK
+            ):
+                score += 1
+            if len((r.get("Full address") or "").strip()) >= 20:
+                score += 1
+            if (r.get("Information") or "").strip():
+                score += 1
+            return score
+
+        by_title: dict[str, dict] = {}
+        extras: list[dict] = []
+        for r in rows:
+            title = (r.get("Name of site, City") or "").strip()
+            if not title:
+                extras.append(r)
+                continue
+            existing = by_title.get(title)
+            if not existing:
+                by_title[title] = r
+                continue
+            # Keep the better row and fill missing fields from the other.
+            a, b = existing, r
+            best, other = (b, a) if _score_export_row(b) > _score_export_row(a) else (a, b)
+            merged = dict(best)
+            for k, v in other.items():
+                if k not in merged or merged.get(k) in ("", None):
+                    merged[k] = v
+            # Prefer longer address when present.
+            if len((other.get("Full address") or "")) > len((merged.get("Full address") or "")):
+                merged["Full address"] = other.get("Full address") or merged.get("Full address")
+            by_title[title] = merged
+
+        if len(by_title) + len(extras) != len(rows):
+            logger.info(
+                "temp_export_deduped city=%s before=%s after=%s",
+                city,
+                len(rows),
+                len(by_title) + len(extras),
+            )
+        rows = list(by_title.values()) + extras
 
     df = pd.DataFrame(rows)
     for col in TEMPORARY_COLUMNS_ORDER:
