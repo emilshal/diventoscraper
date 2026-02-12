@@ -263,22 +263,46 @@ def _run_job(state: RunState) -> None:
         frames: list[pd.DataFrame] = []
         city_results: list[dict[str, Any]] = []
 
+        hard_max = max(1, int(getattr(settings, "TEMP_HARD_MAX_EXHIBITIONS", 200) or 200))
+        absolute_total_setting = int(
+            getattr(settings, "TEMP_ABSOLUTE_MAX_TOTAL_EXHIBITIONS", 10) or 0
+        )
+        absolute_total = absolute_total_setting if absolute_total_setting > 0 else hard_max
+        total_max = int(getattr(settings, "TEMP_TOTAL_MAX_EXHIBITIONS", absolute_total) or 0)
+        if total_max <= 0 or total_max > absolute_total:
+            total_max = absolute_total
+        remaining = total_max
+
         for raw_city in state.cities_requested:
             t_city = time.monotonic()
             try:
-                if window_start is not None and window_end is not None:
+                status = ""
+                err = ""
+                if remaining <= 0:
+                    df = pd.DataFrame()
+                    exhibitions = []
+                    status = "skipped"
+                    err = "global exhibition cap reached"
+                elif window_start is not None and window_end is not None:
                     df = scrape_temporary_exhibitions(
                         raw_city,
                         months=state.months,
                         start_date=window_start,
                         end_date=window_end,
+                        max_exhibitions=remaining,
                     )
                 else:
-                    df = scrape_temporary_exhibitions(raw_city, months=state.months)
+                    df = scrape_temporary_exhibitions(
+                        raw_city, months=state.months, max_exhibitions=remaining
+                    )
                 frames.append(df)
                 exhibitions = df.to_dict(orient="records")
-                status = "ok" if exhibitions else "empty"
-                err = ""
+                if status != "skipped":
+                    status = "ok" if exhibitions else "empty"
+                    try:
+                        remaining -= int(len(df.index))
+                    except Exception:
+                        pass
             except Exception as exc:
                 logger.exception("city_error run_id=%s city=%s: %r", state.run_id, raw_city, exc)
                 exhibitions = []

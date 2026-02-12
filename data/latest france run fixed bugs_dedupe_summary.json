@@ -1,0 +1,16 @@
+{
+  "source_file": "data/latest france run fixed bugs.xlsx",
+  "output_file": "data/latest france run fixed bugs_deduped.xlsx",
+  "log_file": "data/latest france run fixed bugs_dedupe_log.csv",
+  "rows_before": 163,
+  "rows_after": 115,
+  "rows_removed": 48,
+  "matched_groups": 32,
+  "extras_without_full_key": 0,
+  "removed_by_type": {
+    "date_only_collision": 26,
+    "title_contains_variant": 14,
+    "partial_title_overlap": 6,
+    "exact_title_normalized": 2
+  }
+}

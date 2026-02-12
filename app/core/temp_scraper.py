@@ -4,12 +4,13 @@ import re
 import uuid
 import json
 import logging
+import unicodedata
 from hashlib import sha256
 from pathlib import Path
 from datetime import datetime, timedelta
 from html import unescape
 from urllib.parse import urlparse
-from urllib.parse import urljoin
+from urllib.parse import urljoin, parse_qs, quote, unquote
 
 import pandas as pd
 import requests
@@ -30,6 +31,9 @@ _TEMP_VENUE_IMAGE_CACHE: dict[str, str] = {}
 _TEMP_VENUE_COORD_CACHE: dict[str, tuple[str, str, str]] = {}
 _TEMP_VENUE_DISCOVERY_CACHE: dict[str, list[dict[str, str]]] = {}
 _TEMP_VENUE_HOURS_CACHE: dict[str, dict[str, str]] = {}
+_TEMP_IMAGE_LICENSE_CACHE: dict[str, dict[str, str]] = {}
+_TEMP_DURATION_CACHE: dict[str, dict[str, str]] = {}
+_FORBIDDEN_TITLE_CHARS_RE = re.compile(r"[<>;=#{}]")
 
 _VENUE_OPENING_INFO_FALLBACK = (
     getattr(settings, "TEMP_VENUE_HOURS_FALLBACK_VALUE", "See venue website")
@@ -600,6 +604,61 @@ def _parse_date(value: str):
             return None
 
 
+def _split_exhibition_label(label: str) -> tuple[str, str]:
+    """
+    Split a label like:
+    "Title, Exhibition, Venue, City: Date range"
+    into (title, "Venue, City: Date range").
+    """
+    text = str(label or "").strip()
+    if not text:
+        return "", ""
+    lower = text.lower()
+    marker = ", exhibition,"
+    idx = lower.find(marker)
+    if idx < 0:
+        return text, ""
+    title = text[:idx].strip(" ,")
+    remainder = text[idx + len(marker) :].strip(" ,")
+    return title, remainder
+
+
+def _strip_label_date_suffix(value: str) -> str:
+    """
+    Remove a trailing date suffix after the last ':' when that suffix looks date-like.
+    """
+    text = str(value or "").strip()
+    if not text or ":" not in text:
+        return text
+    head, tail = text.rsplit(":", 1)
+    tail_clean = tail.strip()
+    if not tail_clean:
+        return head.strip()
+    if re.search(r"\d", tail_clean):
+        return head.strip()
+    return text
+
+
+def _sanitize_export_title(value: str) -> str:
+    text = str(value or "")
+    text = _FORBIDDEN_TITLE_CHARS_RE.sub("", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip()
+
+
+def _dedupe_export_row_key(row: dict) -> str:
+    label = str(row.get("Name of site, City") or "").strip()
+    if not label:
+        return ""
+    title, remainder = _split_exhibition_label(label)
+    venue_city = _strip_label_date_suffix(remainder)
+    if not title:
+        title = _strip_label_date_suffix(label)
+    real_city = str(row.get("Real city") or row.get("City") or "").strip()
+    country = str(row.get("Country") or "").strip()
+    return _normalise_for_dedupe("|".join([country, real_city, venue_city, title]))
+
+
 _OPENING_HOURS_DAY_ALIASES = {
     "mon": "Mon",
     "monday": "Mon",
@@ -704,20 +763,303 @@ def _dedupe_exhibition_key(item: dict) -> str:
     duplicates leaking through into the final output.
     """
     venue = str(item.get("venue") or "").strip()
+    city = str(item.get("city") or "").strip()
+    country = str(item.get("country") or "").strip()
     label = str(item.get("name") or "").strip()
-    title = label
-    low = label.lower()
-    marker = ", exhibition,"
-    if marker in low:
-        idx = low.find(marker)
-        title = label[:idx].strip()
-    start_raw = str(item.get("start_date") or "").strip()
-    end_raw = str(item.get("end_date") or "").strip()
-    s = _parse_date(start_raw)
-    e = _parse_date(end_raw) if end_raw else None
-    start_iso = s.isoformat() if s else start_raw
-    end_iso = (e.isoformat() if e else end_raw) or start_iso
-    return _normalise_for_dedupe("|".join([venue, title, start_iso, end_iso]))
+    title, _ = _split_exhibition_label(label)
+    title = title or label
+    return _normalise_for_dedupe("|".join([country, city, venue, title]))
+
+
+def _ascii_fold_text(value: str) -> str:
+    text = unescape(str(value or ""))
+    text = unicodedata.normalize("NFKD", text)
+    return text.encode("ascii", "ignore").decode("ascii")
+
+
+def _normalise_for_similarity(value: str) -> str:
+    text = _ascii_fold_text(value).lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def _canonical_venue_for_similarity(value: str) -> str:
+    raw_src = _ascii_fold_text(value).lower().strip()
+    if not raw_src:
+        return ""
+    if "," in raw_src:
+        raw_src = raw_src.split(",", 1)[0].strip()
+    raw = re.sub(r"[^a-z0-9]+", " ", raw_src)
+    raw = re.sub(r"\s{2,}", " ", raw).strip()
+    # Venue aliases often append long descriptors after a comma.
+    # Keep the leading stable part for matching.
+    head = raw.strip()
+    if head.startswith("the "):
+        head = head[4:].strip()
+    return head or raw
+
+
+def _stable_date_pair_strings(start_raw: str, end_raw: str) -> tuple[str, str]:
+    s = _parse_date(str(start_raw or "").strip())
+    e = _parse_date(str(end_raw or "").strip()) if str(end_raw or "").strip() else None
+    start_iso = s.isoformat() if s else str(start_raw or "").strip()
+    end_iso = (e.isoformat() if e else str(end_raw or "").strip()) or start_iso
+    return start_iso, end_iso
+
+
+_TITLE_DEDUPE_STOPWORDS = {
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "of",
+    "in",
+    "on",
+    "for",
+    "to",
+    "de",
+    "du",
+    "des",
+    "la",
+    "le",
+    "les",
+    "et",
+    "un",
+    "une",
+    "el",
+    "los",
+    "las",
+    "una",
+    "unos",
+    "unas",
+    "del",
+    "al",
+    "y",
+    "o",
+    "en",
+    "il",
+    "lo",
+    "gli",
+    "i",
+    "una",
+    "uno",
+    "un",
+    "e",
+    "ed",
+    "di",
+    "da",
+    "della",
+    "delle",
+    "museum",
+    "musee",
+    "museo",
+    "gallery",
+    "galleria",
+    "exhibition",
+    "exposition",
+    "exhibicion",
+    "mostra",
+    "show",
+}
+
+
+_TITLE_TOKEN_EN_EQUIVALENTS = {
+    "transparence": "transparency",
+    "transparencia": "transparency",
+    "transparenza": "transparency",
+    "journee": "day",
+    "journees": "days",
+    "dia": "day",
+    "dias": "days",
+    "giornata": "day",
+    "giornate": "days",
+    "licorne": "unicorn",
+    "licornes": "unicorns",
+    "licornio": "unicorn",
+    "licornios": "unicorns",
+    "unicorno": "unicorn",
+    "unicorni": "unicorns",
+    "amour": "love",
+    "amore": "love",
+    "amor": "love",
+    "lettres": "letters",
+    "lettre": "letter",
+    "lettere": "letters",
+    "parisiennes": "parisian",
+    "parisienne": "parisian",
+    "ciel": "sky",
+    "cielo": "sky",
+    "reine": "queen",
+    "mere": "mother",
+}
+
+
+def _englishise_title_for_dedupe(title: str) -> str:
+    """
+    Best-effort token-level normalization into English for first-word dedupe.
+    """
+    norm = _normalise_for_similarity(title)
+    if not norm:
+        return ""
+    tokens = norm.split()
+    mapped = [_TITLE_TOKEN_EN_EQUIVALENTS.get(tok, tok) for tok in tokens]
+    return " ".join(mapped).strip()
+
+
+def _significant_title_tokens(title: str) -> set[str]:
+    norm = _normalise_for_similarity(title)
+    if not norm:
+        return set()
+    out = set()
+    for tok in norm.split():
+        if len(tok) <= 1 or tok in _TITLE_DEDUPE_STOPWORDS or tok.isdigit():
+            continue
+        out.add(tok)
+    return out
+
+
+def _significant_title_token_list(title: str) -> list[str]:
+    norm = _normalise_for_similarity(title)
+    if not norm:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for tok in norm.split():
+        if len(tok) <= 1 or tok in _TITLE_DEDUPE_STOPWORDS or tok.isdigit():
+            continue
+        if tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+    return out
+
+
+def _first_title_token_for_dedupe(title: str) -> str:
+    """
+    Return a stable leading semantic token for title-variant matching.
+    Titles are best-effort normalized to English first so bilingual variants
+    can share the same first token.
+    """
+    english_title = _englishise_title_for_dedupe(title)
+    ordered = _significant_title_token_list(english_title)
+    if ordered:
+        return ordered[0]
+    norm = _normalise_for_similarity(english_title)
+    if not norm:
+        return ""
+    return norm.split()[0]
+
+
+def _titles_likely_same_exhibition(title_a: str, title_b: str) -> bool:
+    a = _normalise_for_similarity(title_a)
+    b = _normalise_for_similarity(title_b)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+
+    # Strong containment catches cases like:
+    # "Auguste Bartholdi" vs "Auguste Bartholdi Liberty Enlightening the World".
+    if len(a) >= 8 and a in b:
+        return True
+    if len(b) >= 8 and b in a:
+        return True
+
+    ta = _significant_title_tokens(a)
+    tb = _significant_title_tokens(b)
+    if not ta or not tb:
+        return False
+    overlap = len(ta & tb)
+    min_size = min(len(ta), len(tb))
+    if min_size == 0:
+        return False
+
+    containment = overlap / float(min_size)
+    if overlap >= 2 and containment >= 0.8:
+        return True
+    if overlap >= 3 and containment >= 0.67 and abs(len(ta) - len(tb)) <= 3:
+        return True
+
+    # Match bilingual/expanded variants that share the same leading proper-name stem,
+    # e.g. "Cheryl Marie Wade ..." vs "Cheryl Marie Wade ...".
+    ordered_a = _significant_title_token_list(a)
+    ordered_b = _significant_title_token_list(b)
+    # Name-anchor rule for bilingual title variants:
+    # if both titles share the same first two significant tokens (typically artist/person),
+    # treat as the same exhibition within the same venue+date bucket.
+    # Example: "Madame de Sevigne Lettres parisiennes" vs "Madame de Sevigne Parisian letters".
+    if len(ordered_a) >= 2 and len(ordered_b) >= 2 and ordered_a[:2] == ordered_b[:2]:
+        return True
+    if len(ordered_a) >= 3 and len(ordered_b) >= 3 and ordered_a[:3] == ordered_b[:3]:
+        return True
+    return False
+
+
+def _fuzzy_dedupe_items_same_dates(items: list[dict]) -> list[dict]:
+    if not items:
+        return items
+    date_only = int(getattr(settings, "TEMP_DEDUPE_BY_VENUE_DATES_ONLY", 0) or 0) != 0
+
+    grouped: dict[str, list[dict]] = {}
+    extras: list[dict] = []
+    for it in items:
+        label = str(it.get("name") or "").strip()
+        title, remainder = _split_exhibition_label(label)
+        venue_raw = str(it.get("venue") or "").strip()
+        if not venue_raw and remainder:
+            venue_raw = remainder.split(":", 1)[0].strip()
+        start_iso, end_iso = _stable_date_pair_strings(
+            str(it.get("start_date") or "").strip(),
+            str(it.get("end_date") or "").strip(),
+        )
+        venue_key = _canonical_venue_for_similarity(venue_raw)
+        city_key = _normalise_for_similarity(str(it.get("city") or "").strip())
+        country_key = _normalise_for_similarity(str(it.get("country") or "").strip())
+        if not (title and venue_key and start_iso and end_iso):
+            extras.append(it)
+            continue
+        group_key = "|".join([country_key, city_key, venue_key, start_iso, end_iso])
+        grouped.setdefault(group_key, []).append(it)
+
+    deduped: list[dict] = []
+    for group_items in grouped.values():
+        if date_only:
+            ordered = sorted(group_items, key=_score_exhibition_item, reverse=True)
+            kept_by_first: dict[str, dict] = {}
+            for pos, candidate in enumerate(ordered):
+                cand_title, _ = _split_exhibition_label(str(candidate.get("name") or "").strip())
+                cand_title = cand_title or str(candidate.get("name") or "").strip()
+                first_key = _first_title_token_for_dedupe(cand_title) or f"__row_{pos}"
+                existing = kept_by_first.get(first_key)
+                if not existing:
+                    kept_by_first[first_key] = candidate
+                    continue
+                kept_by_first[first_key] = _merge_exhibition_items_keep_best(existing, candidate)
+            deduped.extend(kept_by_first.values())
+            continue
+        ordered = sorted(group_items, key=_score_exhibition_item, reverse=True)
+        kept: list[dict] = []
+        for candidate in ordered:
+            cand_title, _ = _split_exhibition_label(str(candidate.get("name") or "").strip())
+            cand_title = cand_title or str(candidate.get("name") or "").strip()
+            duplicate_idx = -1
+            for idx, existing in enumerate(kept):
+                existing_title, _ = _split_exhibition_label(str(existing.get("name") or "").strip())
+                existing_title = existing_title or str(existing.get("name") or "").strip()
+                if _titles_likely_same_exhibition(cand_title, existing_title):
+                    duplicate_idx = idx
+                    break
+            if duplicate_idx < 0:
+                kept.append(candidate)
+            else:
+                kept[duplicate_idx] = _merge_exhibition_items_keep_best(
+                    kept[duplicate_idx], candidate
+                )
+        deduped.extend(kept)
+
+    deduped.extend(extras)
+    return deduped
 
 
 def _score_exhibition_item(item: dict) -> int:
@@ -736,6 +1078,16 @@ def _score_exhibition_item(item: dict) -> int:
     if open_days and open_days != _VENUE_OPENING_INFO_FALLBACK:
         score += 1
     if opening_hours and opening_hours != _VENUE_OPENING_INFO_FALLBACK:
+        score += 1
+    start_raw = str(item.get("start_date") or "").strip()
+    end_raw = str(item.get("end_date") or "").strip()
+    s = _parse_date(start_raw)
+    e = _parse_date(end_raw) if end_raw else None
+    if s:
+        score += 2
+    if e:
+        score += 2
+    if s and e and e >= s:
         score += 1
     return score
 
@@ -929,6 +1281,73 @@ def _normalise_duration_hours(value) -> str:
         hours = num if num <= 10 else num / 60.0
     label = f"{hours:.2f}".rstrip("0").rstrip(".")
     return label
+
+
+async def _lookup_exhibition_duration_async(
+    *,
+    client: AsyncOpenAI,
+    title: str,
+    venue: str,
+    city: str,
+    country: str,
+    source_url: str,
+    use_web_search_tool: bool,
+) -> dict[str, str] | None:
+    """
+    Best-effort lookup of an explicitly stated visit duration for an exhibition/venue.
+    Returns keys: duration, source_url.
+    """
+    raw_key = "|".join([title or "", venue or "", city or "", country or "", source_url or ""])
+    key = _normalise_for_dedupe(raw_key)
+    if key and key in _TEMP_DURATION_CACHE:
+        return _TEMP_DURATION_CACHE.get(key)
+
+    tools = [{"type": "web_search"}] if use_web_search_tool else None
+    prompt = (
+        "Find the visit duration for this exhibition (or the hosting venue's suggested time to visit if the exhibition duration is not stated).\n"
+        "Use official venue pages or clearly reliable sources.\n"
+        "Return ONLY JSON with keys: duration, source_url.\n"
+        "Rules:\n"
+        "- duration must be an explicitly stated estimate from the source (e.g. '60 minutes', '90 minutes', '1 hour', '1.5 hours', '2 hours').\n"
+        "- If you cannot find an explicit duration, return an empty string for duration.\n"
+        "- source_url must be the page where the duration is stated (or empty string if duration is empty).\n"
+        "- Return no prose.\n\n"
+        f"Exhibition title: {title}\n"
+        f"Venue: {venue}\n"
+        f"City: {city}\n"
+        f"Country: {country}\n"
+        f"Known source_url (may help): {source_url}\n"
+    )
+    try:
+        resp = await _call_with_backoff(
+            lambda: client.responses.create(
+                model=TEMP_SEARCH_MODEL,
+                input=prompt,
+                tools=tools,
+                max_output_tokens=500,
+            ),
+            max_attempts=3,
+        )
+        content = _clean_json_content(resp.output_text or _extract_response_text(resp) or "")
+        data = _extract_json_object(content) if content else None
+        if not isinstance(data, dict):
+            return None
+        duration = str(data.get("duration") or "").strip()
+        src = str(data.get("source_url") or "").strip()
+        out = {"duration": duration, "source_url": src}
+        if key:
+            _TEMP_DURATION_CACHE[key] = out
+        return out
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "temp_duration_lookup_error title=%s venue=%s city=%s country=%s err=%r",
+            title,
+            venue,
+            city,
+            country,
+            exc,
+        )
+        return None
 
 
 def _normalise_city_name(name: str) -> str:
@@ -1146,7 +1565,12 @@ def _normalise_for_match(text: str) -> str:
 
 
 def _validate_temp_copy(
-    title: str, short: str, long_html: str, address: str = ""
+    title: str,
+    venue_for_copy: str,
+    short: str,
+    long_html: str,
+    rating: int | None = None,
+    address: str = "",
 ) -> list[str]:
     violations: list[str] = []
 
@@ -1166,19 +1590,38 @@ def _validate_temp_copy(
         violations.append("long is empty")
         return violations
 
+    if rating is None:
+        violations.append("rating is missing")
+    else:
+        try:
+            r = int(rating)
+        except Exception:
+            r = 0
+        if r not in (1, 2, 3, 4):
+            violations.append("rating must be 1, 2, 3, or 4")
+
     if not long_clean.startswith("<p>") or "</p>" not in long_clean:
         violations.append("long must be HTML paragraphs wrapped in <p> tags")
 
     # Avoid em/en dashes; hyphens are allowed for compounds like "16th-century".
-    if "—" in long_clean or "–" in long_clean:
-        violations.append("long contains dash characters (—/–)")
+    # Allow em/en dashes ONLY when they are part of the official exhibition title or venue name.
+    if "—" in combined_text or "–" in combined_text:
+        text_no_html = _strip_html(long_clean)
+        scrubbed = " ".join([short_clean, text_no_html])
+        for allowed in [title, venue_for_copy]:
+            a = (allowed or "").strip()
+            if not a:
+                continue
+            scrubbed = re.sub(re.escape(a), " ", scrubbed, flags=re.IGNORECASE)
+        if "—" in scrubbed or "–" in scrubbed:
+            violations.append("copy contains dash characters (—/–) outside the title/venue name")
 
     if _contains_source_citations(long_clean):
         violations.append("long contains source citations/URLs")
 
     wc = _word_count_html(long_clean)
-    if wc < 350 or wc > 400:
-        violations.append(f"long word count must be 350–400 (got {wc})")
+    if wc < 280 or wc > 420:
+        violations.append(f"long word count should be near 350 (got {wc})")
 
     lead = _strip_html(long_clean)[:80].lower()
     if lead.startswith("explore "):
@@ -1186,8 +1629,45 @@ def _validate_temp_copy(
     title_head = (title or "").split(":", 1)[0].strip().lower()
     if title_head and lead.startswith(title_head):
         violations.append("long starts with exhibition name")
+    venue_head = (venue_for_copy or "").strip().lower()
+    if venue_head and lead.startswith(venue_head):
+        violations.append("long starts with venue name")
     if lead.startswith("this exhibition"):
         violations.append("long starts with 'this exhibition'")
+    if re.match(r"^(across|through|inside)\\b", lead):
+        violations.append("long starts with a formula opener (Across/Through/Inside)")
+    if lead.startswith("at the "):
+        violations.append("long starts with a formula opener (At The ...)")
+    if lead.startswith("in this show"):
+        violations.append("long starts with a formula opener ('In this show')")
+
+    # Avoid openings that prioritise the layout/structure of the exhibition.
+    # Only enforce on the opening (not the full body), and ignore matches inside title/venue strings.
+    opening_slice = _strip_html(long_clean)[:240]
+    scrubbed_opening = opening_slice
+    for allowed in [title, venue_for_copy]:
+        a = (allowed or "").strip()
+        if not a:
+            continue
+        scrubbed_opening = re.sub(re.escape(a), " ", scrubbed_opening, flags=re.IGNORECASE)
+    opening_forbidden = [
+        "room",
+        "rooms",
+        "gallery",
+        "galleries",
+        "space",
+        "spaces",
+        "display",
+        "displays",
+        "label",
+        "labels",
+        "layout",
+    ]
+    if any(
+        re.search(r"\b" + re.escape(w) + r"\b", scrubbed_opening, flags=re.IGNORECASE)
+        for w in opening_forbidden
+    ):
+        violations.append("long opening mentions rooms/spaces/galleries/displays/labels/layout (disallowed)")
 
     banned = [
         "you",
@@ -1201,11 +1681,39 @@ def _validate_temp_copy(
         "period",
         "accessible",
     ]
-    low = _strip_html(long_clean).lower()
+    low = combined_low
     for w in banned:
         if re.search(r"\b" + re.escape(w) + r"\b", low):
             violations.append(f"long uses banned word '{w}'")
             break
+
+    # Short opening strategy: avoid layout/rooms/galleries/sequence framing.
+    short_forbidden = [
+        "room",
+        "rooms",
+        "gallery",
+        "galleries",
+        "space",
+        "spaces",
+        "display",
+        "displays",
+        "layout",
+        "organisation",
+        "organization",
+        "label",
+        "labels",
+        "panel",
+        "panels",
+        "walkthrough",
+        "first",
+        "next",
+        "final",
+    ]
+    if any(
+        re.search(r"\b" + re.escape(w) + r"\b", short_clean, flags=re.IGNORECASE)
+        for w in short_forbidden
+    ):
+        violations.append("short uses a layout/rooms/galleries/sequence framing word (disallowed)")
 
     # Do not mention exhibition dates in copy (dates are metadata only).
     months = (
@@ -1370,11 +1878,131 @@ def _extract_icon_url(html: str) -> str:
     return ""
 
 
+def _is_svg_image_url(url: str) -> bool:
+    u = (url or "").strip().lower()
+    if not u:
+        return False
+    try:
+        path = (urlparse(u).path or "").lower()
+    except Exception:
+        path = u
+    if path.endswith(".svg") or ".svg?" in u:
+        return True
+    return False
+
+
+def _is_icon_like_image_url(url: str) -> bool:
+    u = (url or "").strip().lower()
+    if not u:
+        return False
+    try:
+        parsed = urlparse(u)
+        host = (parsed.netloc or "").lower()
+        path = (parsed.path or "").lower()
+    except Exception:
+        host = ""
+        path = u
+    if "google.com" in host and "/s2/favicons" in path:
+        return True
+    icon_markers = ("favicon", "apple-touch-icon", "mask-icon", "/icon")
+    return any(marker in path for marker in icon_markers)
+
+
 def _domain_from_url(url: str) -> str:
     try:
         return urlparse(url).netloc or ""
     except Exception:
         return ""
+
+
+def _is_image_url_ok(url: str) -> bool:
+    if not url:
+        return False
+    if _is_svg_image_url(url):
+        return False
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        r = requests.head(url, timeout=8, allow_redirects=True, headers=headers)
+        ct = (r.headers.get("Content-Type") or "").lower()
+        if "image/svg+xml" in ct:
+            return False
+        if r.status_code == 200 and ct.startswith("image/"):
+            return True
+    except Exception:
+        pass
+    try:
+        r = requests.get(url, timeout=10, allow_redirects=True, headers=headers, stream=True)
+        ct = (r.headers.get("Content-Type") or "").lower()
+        if "image/svg+xml" in ct:
+            return False
+        if r.status_code == 200 and ct.startswith("image/"):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _commons_image_url_from_page(page_url: str) -> str:
+    try:
+        parsed = urlparse(page_url)
+    except Exception:
+        return ""
+    if "commons.wikimedia.org" not in (parsed.netloc or ""):
+        return ""
+    title = ""
+    if parsed.path.startswith("/wiki/"):
+        title = parsed.path.split("/wiki/", 1)[1]
+    elif parsed.path.endswith("/w/index.php"):
+        qs = parse_qs(parsed.query or "")
+        title = (qs.get("title") or [""])[0]
+    if not title:
+        return ""
+    title = unquote(title)
+    if not title.startswith("File:"):
+        return ""
+    api_url = (
+        "https://commons.wikimedia.org/w/api.php"
+        f"?action=query&titles={quote(title)}&prop=imageinfo&iiprop=url&format=json"
+    )
+    try:
+        resp = requests.get(api_url, timeout=10)
+        if resp.status_code != 200:
+            return ""
+        data = resp.json()
+        pages = (data.get("query") or {}).get("pages") or {}
+        for _k, v in pages.items():
+            info = (v.get("imageinfo") or [])
+            if info and isinstance(info, list):
+                url = (info[0] or {}).get("url") or ""
+                return str(url).strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _maybe_fix_image_meta(meta: dict[str, str]) -> dict[str, str]:
+    if not meta or not isinstance(meta, dict):
+        return meta
+    img = (meta.get("image_url") or "").strip()
+    page = (meta.get("page_url") or "").strip()
+    if not img:
+        return meta
+    # If image URL is a Commons file page, treat it as the page URL.
+    if "commons.wikimedia.org/wiki/File:" in img and not page:
+        page = img
+        meta["page_url"] = page
+    if _is_image_url_ok(img):
+        return meta
+    # Try to resolve Commons file page -> direct upload URL.
+    if page and "commons.wikimedia.org" in page:
+        resolved = _commons_image_url_from_page(page)
+        if resolved and _is_image_url_ok(resolved):
+            meta["image_url"] = resolved
+            return meta
+    # If still invalid, fall back to placeholder.
+    meta["image_url"] = str(getattr(settings, "TEMP_IMAGE_FALLBACK_URL", "") or "").strip()
+    meta["mode"] = "fallback"
+    return meta
 
 
 def _google_favicon_url(domain: str, *, size: int) -> str:
@@ -1383,6 +2011,763 @@ def _google_favicon_url(domain: str, *, size: int) -> str:
         return ""
     # Returns an image for most domains; used as last-resort to guarantee non-empty URLs.
     return f"https://www.google.com/s2/favicons?domain={d}&sz={size}"
+
+
+def _csv_to_set(value: str) -> set[str]:
+    raw = (value or "").strip()
+    if not raw:
+        return set()
+    parts = [p.strip().lower() for p in raw.split(",")]
+    return {p for p in parts if p}
+
+
+def _domain_matches_any(domain: str, allowed: set[str]) -> bool:
+    d = (domain or "").strip().lower()
+    if not d or not allowed:
+        return False
+    for a in allowed:
+        a = a.strip().lower()
+        if not a:
+            continue
+        if d == a or d.endswith("." + a):
+            return True
+    return False
+
+
+def _license_keyword_ok(license_text: str, allowed_keywords: set[str]) -> bool:
+    t = (license_text or "").strip().lower()
+    if not t:
+        return False
+    # Normalise common punctuation variants.
+    t = t.replace("creative commons", "cc")
+    t = re.sub(r"\s+", " ", t)
+    for kw in allowed_keywords:
+        if kw and kw in t:
+            return True
+    return False
+
+
+def _page_mentions_license(text: str, allowed_keywords: set[str]) -> bool:
+    if not text or not allowed_keywords:
+        return False
+    t = _strip_html(text).lower()
+    t = t.replace("creative commons", "cc")
+    t = re.sub(r"\s+", " ", t)
+    return any(kw in t for kw in allowed_keywords if kw)
+
+
+def _same_site_domain(url_a: str, url_b: str) -> bool:
+    da = _domain_from_url(url_a).lower()
+    db = _domain_from_url(url_b).lower()
+    if not da or not db:
+        return False
+    return da == db or da.endswith("." + db) or db.endswith("." + da)
+
+
+def _clean_rights_text(value: str) -> str:
+    text = _strip_html(value or "")
+    text = re.sub(r"\s+", " ", text).strip(" |;:,.-")
+    text = re.sub(r"[\"'<>]+$", "", text).strip(" |;:,.-")
+    text = re.sub(r"^©\s*photo\b", "© photo", text, flags=re.I)
+    if len(text) > 180:
+        text = text[:180].rsplit(" ", 1)[0].strip()
+    return text
+
+
+def _normalise_compact_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+
+def _image_name_tokens(image_url: str) -> set[str]:
+    try:
+        raw_name = unquote(Path(urlparse(image_url).path).name or "")
+    except Exception:
+        raw_name = ""
+    if not raw_name:
+        return set()
+    no_ext = re.sub(r"\.[a-z0-9]{2,5}$", "", raw_name, flags=re.I)
+    no_ext = re.sub(r"([a-z])([A-Z])", r"\1 \2", no_ext)
+    parts = [p for p in re.split(r"[^a-zA-Z0-9]+", no_ext.lower()) if p]
+    stop = {
+        "image",
+        "img",
+        "photo",
+        "visuel",
+        "exposition",
+        "exhibitions",
+        "museum",
+        "musee",
+        "gallery",
+        "paris",
+        "france",
+        "grandpalais",
+        "header",
+        "hero",
+        "banner",
+        "default",
+        "cover",
+        "thumbnail",
+        "thumb",
+        "small",
+        "large",
+        "desktop",
+        "mobile",
+        "webp",
+        "jpeg",
+        "jpg",
+        "png",
+    }
+    return {p for p in parts if len(p) >= 4 and p not in stop and not p.isdigit()}
+
+
+def _pick_best_credit(candidates: list[str], image_url: str) -> str:
+    if not candidates:
+        return ""
+    tokens = _image_name_tokens(image_url)
+    best = ""
+    best_score = -1
+    seen: set[str] = set()
+    for raw in candidates:
+        cand = _clean_rights_text(raw)
+        if not cand:
+            continue
+        key = _normalise_for_dedupe(cand)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        score = 0
+        compact = _normalise_compact_token(cand)
+        lower = cand.lower()
+        if "©" in cand or "&copy;" in lower or "copyright" in lower:
+            score += 2
+        if "photo" in lower or "credit" in lower:
+            score += 1
+        for token in tokens:
+            if token and token in compact:
+                score += 3
+        if len(cand) <= 120:
+            score += 1
+        if score > best_score:
+            best_score = score
+            best = cand
+    return best
+
+
+def _extract_legal_links_from_html(
+    html: str, *, base_url: str, max_links: int
+) -> list[str]:
+    if not html or max_links <= 0 or not base_url:
+        return []
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return []
+    keywords = (
+        "copyright",
+        "rights",
+        "legal",
+        "terms",
+        "conditions",
+        "mentions-legales",
+        "mentions_legales",
+        "credits",
+        "credit",
+        "license",
+        "licence",
+        "reuse",
+        "impressum",
+        "imprint",
+    )
+    out: list[str] = []
+    seen: set[str] = set()
+    for a in soup.find_all("a"):
+        href = _normalise_http_url(str(a.get("href") or ""), base_url=base_url)
+        if not href:
+            continue
+        if not _same_site_domain(href, base_url):
+            continue
+        label = " ".join(
+            [
+                str(a.get_text(" ", strip=True) or "").lower(),
+                href.lower(),
+            ]
+        )
+        if not any(k in label for k in keywords):
+            continue
+        if href in seen:
+            continue
+        seen.add(href)
+        out.append(href)
+        if len(out) >= max_links:
+            break
+    return out
+
+
+def _extract_rights_from_image_headers(image_url: str) -> dict[str, str]:
+    out = {"rights": "", "license": "", "license_url": "", "credit": ""}
+    if not image_url:
+        return out
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response_headers: dict[str, str] = {}
+    try:
+        resp = requests.head(image_url, timeout=8, allow_redirects=True, headers=headers)
+        response_headers = dict(resp.headers or {})
+    except Exception:
+        response_headers = {}
+    if not response_headers:
+        try:
+            with requests.get(
+                image_url,
+                timeout=10,
+                allow_redirects=True,
+                headers=headers,
+                stream=True,
+            ) as resp:
+                response_headers = dict(resp.headers or {})
+        except Exception:
+            response_headers = {}
+    if not response_headers:
+        return out
+    for key, value in response_headers.items():
+        k = (key or "").lower()
+        v = _clean_rights_text(str(value or ""))
+        if not v:
+            continue
+        if any(x in k for x in ("copyright", "rights")) and not out["rights"]:
+            out["rights"] = v
+            continue
+        if any(x in k for x in ("license", "licence")):
+            if v.lower().startswith(("http://", "https://")) and not out["license_url"]:
+                out["license_url"] = v
+            elif not out["license"]:
+                out["license"] = v
+            continue
+        if any(x in k for x in ("credit", "creator", "author", "byline")) and not out["credit"]:
+            out["credit"] = v
+    return out
+
+
+def _extract_rights_from_html(
+    html: str, *, base_url: str = "", image_url: str = ""
+) -> dict[str, str]:
+    out = {"rights": "", "license": "", "license_url": "", "credit": ""}
+    if not html:
+        return out
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        soup = None
+
+    rights_candidates: list[str] = []
+    license_candidates: list[str] = []
+    credit_candidates: list[str] = []
+
+    if soup is not None:
+        for tag in soup.find_all("meta"):
+            key = (
+                str(tag.get("name") or tag.get("property") or tag.get("itemprop") or "")
+                .strip()
+                .lower()
+            )
+            content = _clean_rights_text(str(tag.get("content") or ""))
+            if not key or not content:
+                continue
+            if "license" in key or "licence" in key:
+                if content.lower().startswith(("http://", "https://")) and not out["license_url"]:
+                    out["license_url"] = content
+                else:
+                    license_candidates.append(content)
+            if "copyright" in key or "rights" in key:
+                rights_candidates.append(content)
+                credit_candidates.append(content)
+            if "credit" in key or "credits" in key:
+                credit_candidates.append(content)
+
+        for link in soup.find_all(["a", "link"]):
+            href = _normalise_http_url(str(link.get("href") or ""), base_url=base_url)
+            if not href:
+                continue
+            rel = " ".join([str(x).lower() for x in (link.get("rel") or [])])
+            if ("license" in rel or "licence" in rel) and not out["license_url"]:
+                out["license_url"] = href
+            if "creativecommons.org/licenses/" in href.lower() and not out["license_url"]:
+                out["license_url"] = href
+
+        def _json_to_text(value) -> str:
+            if isinstance(value, str):
+                return _clean_rights_text(value)
+            if isinstance(value, dict):
+                for k in ("name", "text", "title", "url", "@id"):
+                    if k in value and isinstance(value.get(k), str):
+                        txt = _clean_rights_text(value.get(k) or "")
+                        if txt:
+                            return txt
+                return ""
+            if isinstance(value, list):
+                bits = [_json_to_text(v) for v in value[:5]]
+                bits = [b for b in bits if b]
+                return " | ".join(bits[:3]).strip()
+            return ""
+
+        def _walk_json(node) -> None:
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    lk = str(k).strip().lower()
+                    if lk in ("license", "licence"):
+                        txt = _json_to_text(v)
+                        if txt:
+                            if txt.lower().startswith(("http://", "https://")) and not out["license_url"]:
+                                out["license_url"] = txt
+                            else:
+                                license_candidates.append(txt)
+                    elif lk in (
+                        "copyrightnotice",
+                        "copyright",
+                        "copyrightholder",
+                        "copyrightyear",
+                        "rights",
+                    ):
+                        txt = _json_to_text(v)
+                        if txt:
+                            rights_candidates.append(txt)
+                    elif lk in ("credittext", "credit", "creator", "author", "photographer"):
+                        txt = _json_to_text(v)
+                        if txt:
+                            credit_candidates.append(txt)
+                    _walk_json(v)
+            elif isinstance(node, list):
+                for v in node:
+                    _walk_json(v)
+
+        for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+            raw = (script.string or script.get_text() or "").strip()
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+            _walk_json(data)
+
+    plain = _strip_html(html)
+    if plain:
+        m_license = re.search(
+            r"(Creative\s+Commons[^.;,\n]{0,80}|\bCC(?:[\s\-]?(?:BY(?:[\s\-]?(?:SA|NC|ND))?|0))\b(?:\s+[0-9](?:\.[0-9])?)?|Public\s+Domain)",
+            plain,
+            flags=re.I,
+        )
+        if m_license:
+            license_candidates.append(_clean_rights_text(m_license.group(0)))
+        m_rights = re.search(r"\b(All rights reserved|Some rights reserved)\b", plain, flags=re.I)
+        if m_rights:
+            rights_candidates.append(_clean_rights_text(m_rights.group(0)))
+
+    for m in re.finditer(r"(?:©|&copy;)\s*[^<\n\r]{2,160}", html, flags=re.I):
+        credit_candidates.append(_clean_rights_text(m.group(0)))
+
+    if image_url:
+        try:
+            image_name = unquote(Path(urlparse(image_url).path).name or "")
+        except Exception:
+            image_name = ""
+        if image_name:
+            idx = html.lower().find(image_name.lower())
+            if idx >= 0:
+                window = html[max(0, idx - 3000) : idx + 3000]
+                for m in re.finditer(r"(?:©|&copy;)\s*[^<\n\r]{2,160}", window, flags=re.I):
+                    credit_candidates.append(_clean_rights_text(m.group(0)))
+                m_window_rights = re.search(
+                    r"\b(All rights reserved|Some rights reserved)\b", window, flags=re.I
+                )
+                if m_window_rights:
+                    rights_candidates.append(_clean_rights_text(m_window_rights.group(0)))
+
+    m_cc_url = re.search(
+        r"https?://creativecommons\.org/licenses/[^\s\"'<>]+",
+        html,
+        flags=re.I,
+    )
+    if m_cc_url and not out["license_url"]:
+        out["license_url"] = _normalise_http_url(m_cc_url.group(0), base_url=base_url)
+
+    if not out["license"]:
+        for cand in license_candidates:
+            c = _clean_rights_text(cand)
+            if not c:
+                continue
+            if re.search(r"(creative\s+commons|^cc|public\s+domain)", c, flags=re.I):
+                out["license"] = c
+                break
+        if not out["license"] and license_candidates:
+            out["license"] = _clean_rights_text(license_candidates[0])
+
+    if not out["rights"]:
+        for cand in rights_candidates:
+            c = _clean_rights_text(cand)
+            if not c:
+                continue
+            if re.search(r"\b(all rights reserved|some rights reserved)\b", c, flags=re.I):
+                out["rights"] = c
+                break
+        if not out["rights"] and rights_candidates:
+            out["rights"] = _clean_rights_text(rights_candidates[0])
+
+    if not out["credit"]:
+        out["credit"] = _pick_best_credit(credit_candidates, image_url)
+
+    if out["license_url"]:
+        out["license_url"] = _normalise_http_url(out["license_url"], base_url=base_url)
+    return out
+
+
+def _merge_image_rights_fields(
+    base_meta: dict[str, str], extra_meta: dict[str, str] | None
+) -> dict[str, str]:
+    out = dict(base_meta or {})
+    extra = extra_meta or {}
+    for key in ("credit", "license", "license_url", "rights"):
+        incoming = _clean_rights_text(str(extra.get(key) or ""))
+        if not incoming:
+            continue
+        existing = str(out.get(key) or "").strip()
+        if key == "rights" and existing.lower() == "rights unknown":
+            out[key] = incoming
+            continue
+        if not existing:
+            out[key] = incoming
+    if not (out.get("page_url") or "").strip():
+        page = _normalise_http_url(str(extra.get("page_url") or ""), base_url="")
+        if page:
+            out["page_url"] = page
+    return out
+
+
+async def _search_image_rights_with_openai_async(
+    *,
+    client: AsyncOpenAI,
+    venue: str,
+    city: str,
+    country: str,
+    page_url: str,
+    image_url: str,
+    use_web_search_tool: bool,
+) -> dict[str, str] | None:
+    tools = [{"type": "web_search"}] if use_web_search_tool else None
+    image_name = ""
+    try:
+        image_name = unquote(Path(urlparse(image_url).path).name or "")
+    except Exception:
+        image_name = ""
+    prompt = (
+        "Find copyright/licensing attribution details for the image used on this venue page.\n"
+        "Return ONLY JSON with keys: rights, credit, license, license_url, source_url.\n"
+        "Rules:\n"
+        "- Use explicit statements only; do not infer or invent.\n"
+        "- Prefer official venue pages/legal pages/image pages.\n"
+        "- If a field is unknown, return an empty string for that field.\n\n"
+        f"Venue: {venue}\n"
+        f"City: {city}\n"
+        f"Country: {country}\n"
+        f"Venue page URL: {page_url}\n"
+        f"Image URL: {image_url}\n"
+        f"Image filename hint: {image_name}\n"
+    )
+    try:
+        resp = await _call_with_backoff(
+            lambda: client.responses.create(
+                model=TEMP_SEARCH_MODEL,
+                input=prompt,
+                tools=tools,
+                max_output_tokens=700,
+            ),
+            max_attempts=3,
+        )
+        content = _clean_json_content(resp.output_text or _extract_response_text(resp) or "")
+        data = _extract_json_object(content) if content else None
+        if not isinstance(data, dict):
+            return None
+        source = _normalise_http_url(str(data.get("source_url") or ""), base_url=page_url)
+        if not source:
+            return None
+        src_domain = _domain_from_url(source)
+        allowed = _csv_to_set(getattr(settings, "TEMP_IMAGE_ALLOWED_SOURCE_DOMAINS", "") or "")
+        allowed.update(_csv_to_set(getattr(settings, "TEMP_IMAGE_OPEN_ACCESS_DOMAINS", "") or ""))
+        if not _same_site_domain(source, page_url) and (
+            not allowed or not _domain_matches_any(src_domain, allowed)
+        ):
+            return None
+        out = {
+            "rights": _clean_rights_text(str(data.get("rights") or "")),
+            "credit": _clean_rights_text(str(data.get("credit") or "")),
+            "license": _clean_rights_text(str(data.get("license") or "")),
+            "license_url": _normalise_http_url(str(data.get("license_url") or ""), base_url=source),
+            "page_url": source,
+        }
+        if not out["rights"] and not out["license"] and not out["credit"]:
+            return None
+        return out
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "temp_image_rights_search_error venue=%s city=%s country=%s err=%r",
+            venue,
+            city,
+            country,
+            exc,
+        )
+        return None
+
+
+async def _enrich_image_rights_meta_async(
+    *,
+    meta: dict[str, str],
+    venue: str,
+    city: str,
+    country: str,
+    source_url: str,
+) -> dict[str, str]:
+    out = dict(meta or {})
+    image_url = (out.get("image_url") or "").strip()
+    if not image_url:
+        return out
+    page_url = _normalise_http_url((out.get("page_url") or "").strip(), base_url=source_url)
+    if not page_url:
+        page_url = _normalise_http_url(source_url, base_url="")
+    if not page_url:
+        return out
+    out["page_url"] = page_url
+
+    page_html = await asyncio.to_thread(_fetch_url_text, page_url)
+    if page_html:
+        found = _extract_rights_from_html(page_html, base_url=page_url, image_url=image_url)
+        out = _merge_image_rights_fields(out, found)
+
+    need_more = not (out.get("rights") or out.get("license"))
+    if need_more:
+        header_found = await asyncio.to_thread(_extract_rights_from_image_headers, image_url)
+        out = _merge_image_rights_fields(out, header_found)
+
+    need_more = not (out.get("rights") or out.get("license"))
+    if need_more and page_html:
+        max_links = max(0, int(getattr(settings, "TEMP_IMAGE_RIGHTS_LEGAL_LINK_MAX", 3) or 0))
+        links = _extract_legal_links_from_html(page_html, base_url=page_url, max_links=max_links)
+        for link in links:
+            legal_html = await asyncio.to_thread(_fetch_url_text, link)
+            if not legal_html:
+                continue
+            found = _extract_rights_from_html(legal_html, base_url=link, image_url=image_url)
+            if found.get("license") and not found.get("license_url"):
+                found["license_url"] = link
+            found["page_url"] = link
+            out = _merge_image_rights_fields(out, found)
+            if out.get("rights") or out.get("license"):
+                break
+
+    need_more = not (out.get("rights") or out.get("license"))
+    web_search_enabled = (
+        int(getattr(settings, "TEMP_IMAGE_RIGHTS_WEB_SEARCH_ENABLED", 1) or 0) != 0
+    )
+    if need_more and web_search_enabled:
+        client = _get_openai_client()
+        if client is not None:
+            use_web_search_tool = "search-api" not in TEMP_SEARCH_MODEL.lower()
+            found = await _search_image_rights_with_openai_async(
+                client=client,
+                venue=venue,
+                city=city,
+                country=country,
+                page_url=page_url,
+                image_url=image_url,
+                use_web_search_tool=use_web_search_tool,
+            )
+            out = _merge_image_rights_fields(out, found)
+
+    return out
+
+
+def _format_image_legend(meta: dict[str, str] | None) -> str:
+    if not isinstance(meta, dict):
+        return ""
+    img = (meta.get("image_url") or "").strip()
+    if not img:
+        return ""
+    if (meta.get("mode") or "").strip().lower() in ("fallback", "placeholder"):
+        return "Placeholder image"
+
+    def _no_commas_text(value: str) -> str:
+        s = (value or "").replace(",", " ")
+        return re.sub(r"\s{2,}", " ", s).strip()
+
+    def _no_commas_url(value: str) -> str:
+        # Avoid commas because downstream CSV-style parsing may treat them as separators.
+        # Keep the URL valid by percent-encoding commas.
+        return (value or "").strip().replace(",", "%2C")
+
+    parts: list[str] = []
+    credit = _no_commas_text(meta.get("credit") or "")
+    if credit:
+        parts.append(credit)
+    lic = _no_commas_text(meta.get("license") or "")
+    if lic:
+        parts.append(f"License: {lic}")
+    rights = (meta.get("rights") or "").strip()
+    if rights:
+        parts.append(_no_commas_text(rights))
+    lic_url = _no_commas_url(meta.get("license_url") or "")
+    if lic_url:
+        parts.append(f"License URL: {lic_url}")
+    page = _no_commas_url(meta.get("page_url") or "")
+    if page:
+        parts.append(f"Source: {page}")
+    return " | ".join(parts).strip()
+
+
+async def _find_reusable_venue_image_async(
+    *,
+    client: AsyncOpenAI,
+    venue: str,
+    city: str,
+    country: str,
+    use_web_search_tool: bool,
+) -> dict[str, str] | None:
+    """
+    Best-effort search for a venue image with explicit reuse-friendly licensing signals.
+    Returns dict keys: image_url, page_url, license, license_url, credit.
+    """
+    tools = [{"type": "web_search"}] if use_web_search_tool else None
+    allowed_kw = _csv_to_set(getattr(settings, "TEMP_IMAGE_ALLOWED_LICENSE_KEYWORDS", "") or "")
+    allowed_domains = _csv_to_set(
+        getattr(settings, "TEMP_IMAGE_ALLOWED_SOURCE_DOMAINS", "") or ""
+    )
+    prompt = (
+        "Find a reusable image for this museum/gallery venue.\n"
+        "Return ONLY JSON with keys: image_url, page_url, license, license_url, credit.\n"
+        "Rules:\n"
+        "- The image MUST be allowed for reuse under a permissive license.\n"
+        "- Prefer sources with explicit licensing info like Wikimedia Commons or Europeana.\n"
+        "- license should be something like 'CC0', 'Public Domain', 'CC BY 4.0', 'CC BY-SA 4.0'.\n"
+        "- license_url must link to the license page (or the image page section that clearly states the license).\n"
+        "- credit must be a short attribution string suitable for publication when required (author/creator if shown, plus source).\n"
+        "- image_url must be a direct image URL (jpg/png/webp).\n"
+        "- If you cannot find a clearly reusable image, return empty strings for all keys.\n\n"
+        f"Venue: {venue}\nCity: {city}\nCountry: {country}\n"
+        f"Allowed license keywords: {', '.join(sorted(allowed_kw)) or '(none)'}\n"
+        f"Preferred source domains: {', '.join(sorted(allowed_domains)) or '(none)'}\n"
+    )
+    try:
+        resp = await _call_with_backoff(
+            lambda: client.responses.create(
+                model=TEMP_SEARCH_MODEL,
+                input=prompt,
+                tools=tools,
+                max_output_tokens=900,
+            ),
+            max_attempts=3,
+        )
+        content = _clean_json_content(resp.output_text or _extract_response_text(resp) or "")
+        data = _extract_json_object(content) if content else None
+        if not isinstance(data, dict):
+            return None
+        img = _normalise_http_url(str(data.get("image_url") or ""), base_url="")
+        page = _normalise_http_url(str(data.get("page_url") or ""), base_url="")
+        lic = str(data.get("license") or "").strip()
+        lic_url = _normalise_http_url(str(data.get("license_url") or ""), base_url=page)
+        credit = str(data.get("credit") or "").strip()
+        if not img or not page:
+            return None
+        domain = _domain_from_url(page)
+        if allowed_domains and not _domain_matches_any(domain, allowed_domains):
+            return None
+        if allowed_kw and not _license_keyword_ok(lic, allowed_kw):
+            return None
+        return {
+            "image_url": img,
+            "page_url": page,
+            "license": lic,
+            "license_url": lic_url,
+            "credit": credit,
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "temp_image_reuse_search_error venue=%s city=%s country=%s err=%r",
+            venue,
+            city,
+            country,
+            exc,
+        )
+        return None
+
+
+async def _find_generic_venue_image_meta_async(
+    *,
+    client: AsyncOpenAI,
+    venue: str,
+    city: str,
+    country: str,
+    use_web_search_tool: bool,
+) -> dict[str, str] | None:
+    """
+    Best-effort generic venue photo lookup (not exhibition-specific).
+    Intended as a fallback before placeholder.
+    Returns keys: image_url, page_url, license, license_url, credit, mode.
+    """
+    tools = [{"type": "web_search"}] if use_web_search_tool else None
+    prompt = (
+        "Find a photo image URL of the venue building/interior for this museum/gallery.\n"
+        "Return ONLY JSON with keys: image_url, page_url, license, license_url, credit.\n"
+        "Rules:\n"
+        "- Do NOT require this to be about a specific exhibition.\n"
+        "- Do NOT return exhibition posters/banners/artwork crops when a venue photo is available.\n"
+        "- Prefer official venue pages, Wikimedia Commons, or other public pages.\n"
+        "- Avoid press-login pages and ticketing overlays.\n"
+        "- image_url must be a direct image URL (jpg/png/webp) when possible.\n"
+        "- If license/credit is unknown, leave those fields empty.\n\n"
+        f"Venue: {venue}\nCity: {city}\nCountry: {country}\n"
+    )
+    try:
+        resp = await _call_with_backoff(
+            lambda: client.responses.create(
+                model=TEMP_SEARCH_MODEL,
+                input=prompt,
+                tools=tools,
+                max_output_tokens=700,
+            ),
+            max_attempts=3,
+        )
+        content = _clean_json_content(resp.output_text or _extract_response_text(resp) or "")
+        data = _extract_json_object(content) if content else None
+        if not isinstance(data, dict):
+            return None
+        img = _normalise_http_url(str(data.get("image_url") or ""), base_url="")
+        page = _normalise_http_url(str(data.get("page_url") or ""), base_url="")
+        if not img and page:
+            html_page = await asyncio.to_thread(_fetch_url_text, page)
+            img = _normalise_http_url(_extract_meta_image_url(html_page), base_url=page)
+            if not img:
+                icon = _normalise_http_url(_extract_icon_url(html_page), base_url=page)
+                if icon:
+                    img = icon
+        if not img:
+            return None
+        if not _is_image_url_ok(img):
+            return None
+        meta = {
+            "image_url": img,
+            "page_url": page,
+            "license": str(data.get("license") or "").strip(),
+            "license_url": _normalise_http_url(str(data.get("license_url") or ""), base_url=page),
+            "credit": str(data.get("credit") or "").strip(),
+            "mode": "venue_fallback",
+        }
+        return _maybe_fix_image_meta(meta)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "temp_generic_venue_image_search_error venue=%s city=%s country=%s err=%r",
+            venue,
+            city,
+            country,
+            exc,
+        )
+        return None
 
 
 async def _discover_venues_async(
@@ -1497,6 +2882,48 @@ async def _get_venue_image_url_async(
     if cache_key and cache_key in _TEMP_VENUE_IMAGE_CACHE:
         return _TEMP_VENUE_IMAGE_CACHE.get(cache_key, "")
 
+    license_mode = str(getattr(settings, "TEMP_IMAGE_LICENSE_MODE", "strict") or "strict").strip().lower()
+    strict_license = license_mode == "strict"
+    soft_license = license_mode == "soft"
+
+    # In strict mode, skip non-licensed extraction paths and only accept reusable images
+    # from sources with explicit licensing signals. Otherwise fall back to the configured placeholder.
+    if strict_license:
+        client = _get_openai_client()
+        if client is not None:
+            use_web_search_tool = "search-api" not in TEMP_SEARCH_MODEL.lower()
+            found = await _find_reusable_venue_image_async(
+                client=client,
+                venue=venue,
+                city=city,
+                country=country,
+                use_web_search_tool=use_web_search_tool,
+            )
+            if found and found.get("image_url"):
+                img = found["image_url"]
+                if cache_key:
+                    _TEMP_VENUE_IMAGE_CACHE[cache_key] = img
+                logger.info(
+                    "temp_image_selected mode=strict venue=%s city=%s country=%s image=%s license=%s",
+                    venue,
+                    city,
+                    country,
+                    img,
+                    (found.get("license") or ""),
+                )
+                return img
+        img = str(getattr(settings, "TEMP_IMAGE_FALLBACK_URL", "") or "").strip()
+        if cache_key:
+            _TEMP_VENUE_IMAGE_CACHE[cache_key] = img or ""
+        logger.info(
+            "temp_image_selected mode=strict_fallback venue=%s city=%s country=%s image=%s",
+            venue,
+            city,
+            country,
+            img,
+        )
+        return img or ""
+
     # 1) Exhibition page
     html = await asyncio.to_thread(_fetch_url_text, source_url)
     img = _normalise_http_url(_extract_meta_image_url(html), base_url=source_url)
@@ -1513,6 +2940,10 @@ async def _get_venue_image_url_async(
             if icon:
                 img = icon
 
+    # Do not keep icon-like or svg assets as the final image.
+    if img and (_is_icon_like_image_url(img) or _is_svg_image_url(img)):
+        img = ""
+
     # 3) Domain favicon fallback (cheap, usually available).
     if not img:
         domain = _domain_from_url(homepage or source_url)
@@ -1527,15 +2958,28 @@ async def _get_venue_image_url_async(
         if client is not None:
             use_web_search_tool = "search-api" not in TEMP_SEARCH_MODEL.lower()
             tools = [{"type": "web_search"}] if use_web_search_tool else None
-            prompt = (
-                "Find a public, non-press venue photo image URL for this museum/gallery.\n"
-                "Return ONLY JSON with keys: image_url, page_url.\n"
-                "- Prefer the official venue website.\n"
-                "- Do not use press login/press kit pages.\n"
-                "- image_url must be a direct image URL (jpg/png/webp).\n"
-                "- If you cannot find a suitable image, return empty strings.\n\n"
-                f"Venue: {venue}\nCity: {city}\nCountry: {country}\n"
-            )
+            # In soft mode, try to prefer reusable images, but fall back to any public image.
+            if soft_license:
+                found = await _find_reusable_venue_image_async(
+                    client=client,
+                    venue=venue,
+                    city=city,
+                    country=country,
+                    use_web_search_tool=use_web_search_tool,
+                )
+                if found and found.get("image_url"):
+                    img = found["image_url"]
+            if not img:
+                prompt = (
+                    "Find a public, non-press venue photo image URL for this museum/gallery.\n"
+                    "Return ONLY JSON with keys: image_url, page_url.\n"
+                    "- Do NOT return exhibition posters/banners/artwork crops when a venue photo is available.\n"
+                    "- Prefer the official venue website.\n"
+                    "- Do not use press login/press kit pages.\n"
+                    "- image_url must be a direct image URL (jpg/png/webp).\n"
+                    "- If you cannot find a suitable image, return empty strings.\n\n"
+                    f"Venue: {venue}\nCity: {city}\nCountry: {country}\n"
+                )
             try:
                 resp = await _call_with_backoff(
                     lambda: client.responses.create(
@@ -1577,6 +3021,292 @@ async def _get_venue_image_url_async(
     if cache_key:
         _TEMP_VENUE_IMAGE_CACHE[cache_key] = img or ""
     return img or ""
+
+
+async def _get_venue_image_meta_async(
+    *, venue: str, city: str, country: str, source_url: str
+) -> dict[str, str]:
+    """
+    Return image metadata for a venue image suitable for Excel export.
+    Keys: image_url, page_url, license, license_url, credit, mode.
+    """
+    homepage = _venue_homepage_from_url(source_url) or ""
+    cache_key = _normalise_for_dedupe("|".join([venue, city, country, homepage or source_url]))
+    if cache_key and cache_key in _TEMP_IMAGE_LICENSE_CACHE:
+        cached = _TEMP_IMAGE_LICENSE_CACHE.get(cache_key) or {}
+        if cached.get("image_url"):
+            return dict(cached)
+
+    license_mode = str(getattr(settings, "TEMP_IMAGE_LICENSE_MODE", "strict") or "strict").strip().lower()
+    strict_license = license_mode == "strict"
+    soft_license = license_mode == "soft"
+
+    # Strict mode: only accept reusable images (with explicit license fields).
+    if strict_license:
+        client = _get_openai_client()
+        if client is not None:
+            use_web_search_tool = "search-api" not in TEMP_SEARCH_MODEL.lower()
+            found = await _find_reusable_venue_image_async(
+                client=client,
+                venue=venue,
+                city=city,
+                country=country,
+                use_web_search_tool=use_web_search_tool,
+            )
+            if found and found.get("image_url"):
+                meta = {
+                    "image_url": found.get("image_url") or "",
+                    "page_url": found.get("page_url") or "",
+                    "license": found.get("license") or "",
+                    "license_url": found.get("license_url") or "",
+                    "credit": found.get("credit") or "",
+                    "mode": "strict",
+                }
+                logger.info(
+                    "temp_image_selected mode=strict venue=%s city=%s country=%s image=%s license=%s",
+                    venue,
+                    city,
+                    country,
+                    meta.get("image_url") or "",
+                    meta.get("license") or "",
+                )
+                meta = _maybe_fix_image_meta(meta)
+                if cache_key:
+                    _TEMP_IMAGE_LICENSE_CACHE[cache_key] = dict(meta)
+                    _TEMP_VENUE_IMAGE_CACHE[cache_key] = meta["image_url"]
+                return meta
+            # If strict reusable search fails, try a generic venue photo before placeholder.
+            generic = await _find_generic_venue_image_meta_async(
+                client=client,
+                venue=venue,
+                city=city,
+                country=country,
+                use_web_search_tool=use_web_search_tool,
+            )
+            if generic and generic.get("image_url"):
+                meta = await _enrich_image_rights_meta_async(
+                    meta=generic,
+                    venue=venue,
+                    city=city,
+                    country=country,
+                    source_url=source_url,
+                )
+                if not (meta.get("rights") or meta.get("license")):
+                    meta["rights"] = "Rights unknown"
+                if cache_key:
+                    _TEMP_IMAGE_LICENSE_CACHE[cache_key] = dict(meta)
+                    _TEMP_VENUE_IMAGE_CACHE[cache_key] = meta.get("image_url") or ""
+                logger.info(
+                    "temp_image_selected mode=strict_venue_fallback venue=%s city=%s country=%s image=%s",
+                    venue,
+                    city,
+                    country,
+                    meta.get("image_url") or "",
+                )
+                return meta
+        img = str(getattr(settings, "TEMP_IMAGE_FALLBACK_URL", "") or "").strip()
+        meta = {
+            "image_url": img,
+            "page_url": "",
+            "license": "",
+            "license_url": "",
+            "credit": "",
+            "mode": "fallback",
+        }
+        logger.info(
+            "temp_image_selected mode=strict_fallback venue=%s city=%s country=%s image=%s",
+            venue,
+            city,
+            country,
+            img,
+        )
+        meta = _maybe_fix_image_meta(meta)
+        if cache_key:
+            _TEMP_IMAGE_LICENSE_CACHE[cache_key] = dict(meta)
+            _TEMP_VENUE_IMAGE_CACHE[cache_key] = meta.get("image_url") or ""
+        return meta
+
+    # Non-strict modes: try meta tags / favicon, then OpenAI fallback.
+    img = ""
+    page = ""
+
+    html = await asyncio.to_thread(_fetch_url_text, source_url)
+    img = _normalise_http_url(_extract_meta_image_url(html), base_url=source_url)
+    if img:
+        page = source_url
+    if not img:
+        icon = _normalise_http_url(_extract_icon_url(html), base_url=source_url)
+        if icon:
+            img = icon
+            page = source_url
+    if not img and homepage:
+        html_home = await asyncio.to_thread(_fetch_url_text, homepage)
+        img = _normalise_http_url(_extract_meta_image_url(html_home), base_url=homepage)
+        if img:
+            page = homepage
+        if not img:
+            icon = _normalise_http_url(_extract_icon_url(html_home), base_url=homepage)
+            if icon:
+                img = icon
+                page = homepage
+
+    # If we only found favicon/icon/svg assets, force deeper venue image search.
+    if img and (_is_icon_like_image_url(img) or _is_svg_image_url(img)):
+        img = ""
+        page = ""
+
+    if not img:
+        domain = _domain_from_url(homepage or source_url)
+        if domain:
+            img = _google_favicon_url(
+                domain, size=int(getattr(settings, "TEMP_IMAGE_FAVICON_SIZE", 256) or 256)
+            )
+            page = homepage or source_url
+
+    if not img:
+        client = _get_openai_client()
+        if client is not None:
+            use_web_search_tool = "search-api" not in TEMP_SEARCH_MODEL.lower()
+            tools = [{"type": "web_search"}] if use_web_search_tool else None
+            if soft_license:
+                found = await _find_reusable_venue_image_async(
+                    client=client,
+                    venue=venue,
+                    city=city,
+                    country=country,
+                    use_web_search_tool=use_web_search_tool,
+                )
+                if found and found.get("image_url"):
+                    meta = {
+                        "image_url": found.get("image_url") or "",
+                        "page_url": found.get("page_url") or "",
+                        "license": found.get("license") or "",
+                        "license_url": found.get("license_url") or "",
+                        "credit": found.get("credit") or "",
+                        "mode": "soft",
+                    }
+                    meta = _maybe_fix_image_meta(meta)
+                    if cache_key:
+                        _TEMP_IMAGE_LICENSE_CACHE[cache_key] = dict(meta)
+                        _TEMP_VENUE_IMAGE_CACHE[cache_key] = meta["image_url"]
+                    return meta
+            prompt = (
+                "Find a public, non-press venue photo image URL for this museum/gallery.\n"
+                "Return ONLY JSON with keys: image_url, page_url.\n"
+                "- Do NOT return exhibition posters/banners/artwork crops when a venue photo is available.\n"
+                "- Prefer the official venue website.\n"
+                "- Do not use press login/press kit pages.\n"
+                "- image_url must be a direct image URL (jpg/png/webp).\n"
+                "- If you cannot find a suitable image, return empty strings.\n\n"
+                f"Venue: {venue}\nCity: {city}\nCountry: {country}\n"
+            )
+            try:
+                resp = await _call_with_backoff(
+                    lambda: client.responses.create(
+                        model=TEMP_SEARCH_MODEL,
+                        input=prompt,
+                        tools=tools,
+                        max_output_tokens=500,
+                    ),
+                    max_attempts=3,
+                )
+                content = _clean_json_content(resp.output_text or _extract_response_text(resp) or "")
+                data = _extract_json_object(content) if content else None
+                if isinstance(data, dict):
+                    img = _normalise_http_url(str(data.get("image_url") or ""), base_url="")
+                    page = _normalise_http_url(str(data.get("page_url") or ""), base_url="")
+            except Exception:
+                pass
+
+    # Open-access domain fallback (only if page explicitly mentions reuse-friendly license).
+    if img and page:
+        allowed_open_access = _csv_to_set(
+            getattr(settings, "TEMP_IMAGE_OPEN_ACCESS_DOMAINS", "") or ""
+        )
+        allowed_kw = _csv_to_set(getattr(settings, "TEMP_IMAGE_ALLOWED_LICENSE_KEYWORDS", "") or "")
+        page_domain = _domain_from_url(page)
+        if allowed_open_access and _domain_matches_any(page_domain, allowed_open_access):
+            html_page = await asyncio.to_thread(_fetch_url_text, page)
+            if _page_mentions_license(html_page, allowed_kw):
+                meta = _maybe_fix_image_meta({
+                    "image_url": img,
+                    "page_url": page,
+                    "license": "",
+                    "license_url": "",
+                    "credit": "",
+                    "mode": "open_access",
+                })
+                meta = await _enrich_image_rights_meta_async(
+                    meta=meta,
+                    venue=venue,
+                    city=city,
+                    country=country,
+                    source_url=source_url,
+                )
+                if cache_key:
+                    _TEMP_IMAGE_LICENSE_CACHE[cache_key] = dict(meta)
+                    _TEMP_VENUE_IMAGE_CACHE[cache_key] = meta.get("image_url") or ""
+                return meta
+
+    # Soft fallback: allow official page images but mark rights unknown.
+    soft_fallback_enabled = int(getattr(settings, "TEMP_IMAGE_SOFT_FALLBACK_ENABLED", 1) or 0) != 0
+    if soft_fallback_enabled and img:
+        meta = _maybe_fix_image_meta({
+            "image_url": img,
+            "page_url": page,
+            "license": "",
+            "license_url": "",
+            "credit": "",
+            "rights": "",
+            "mode": "soft_fallback",
+        })
+        meta = await _enrich_image_rights_meta_async(
+            meta=meta,
+            venue=venue,
+            city=city,
+            country=country,
+            source_url=source_url,
+        )
+        if not (meta.get("rights") or meta.get("license")):
+            meta["rights"] = "Rights unknown"
+    else:
+        # Before placeholder, try a generic venue photo search.
+        generic = None
+        client = _get_openai_client()
+        if client is not None:
+            use_web_search_tool = "search-api" not in TEMP_SEARCH_MODEL.lower()
+            generic = await _find_generic_venue_image_meta_async(
+                client=client,
+                venue=venue,
+                city=city,
+                country=country,
+                use_web_search_tool=use_web_search_tool,
+            )
+        if generic and generic.get("image_url"):
+            meta = await _enrich_image_rights_meta_async(
+                meta=generic,
+                venue=venue,
+                city=city,
+                country=country,
+                source_url=source_url,
+            )
+            if not (meta.get("rights") or meta.get("license")):
+                meta["rights"] = "Rights unknown"
+        else:
+            img = str(getattr(settings, "TEMP_IMAGE_FALLBACK_URL", "") or "").strip()
+            meta = _maybe_fix_image_meta({
+                "image_url": img,
+                "page_url": "",
+                "license": "",
+                "license_url": "",
+                "credit": "",
+                "mode": "fallback",
+            })
+
+    if cache_key:
+        _TEMP_IMAGE_LICENSE_CACHE[cache_key] = dict(meta)
+        _TEMP_VENUE_IMAGE_CACHE[cache_key] = meta.get("image_url") or ""
+    return meta
 
 
 def _generate_temp_copy(
@@ -1728,8 +3458,6 @@ async def _generate_temp_copy_async(
     duration: str,
     avoid_short_openers: list[str] | None = None,
     avoid_long_openers: list[str] | None = None,
-    required_short_opener: str | None = None,
-    required_long_prefix: str | None = None,
 ) -> dict[str, str]:
     """
     Pass 2: generate English short/long copy for a single temporary exhibition.
@@ -1746,25 +3474,26 @@ async def _generate_temp_copy_async(
         w.strip() for w in (avoid_long_openers or []) if w and w.strip()
     ]
     avoid_short_clause = (
-        "- Do not start the short description with any of these opening words: "
+        "- Do not start the short description with any of these opening words/phrases: "
         + ", ".join(sorted(set(avoid_short_openers))[:12])
         + ".\n"
         if avoid_short_openers
         else ""
     )
     avoid_long_clause = (
-        "- Do not start the long description with any of these opening words: "
+        "- Do not start the long description with any of these opening words/phrases: "
         + ", ".join(sorted(set(avoid_long_openers))[:12])
         + ".\n"
         if avoid_long_openers
         else ""
     )
 
+    venue_for_copy = _with_title_the_for_copy(venue)
     base_prompt = (
         "Write copy for a Divento temporary exhibition listing.\n\n"
         "INPUTS\n"
         f"- Title: {title}\n"
-        f"- Venue: {venue}\n"
+        f"- Venue: {venue_for_copy}\n"
         f"- City: {city}\n"
         f"- Country: {country}\n"
         "\n"
@@ -1777,20 +3506,29 @@ async def _generate_temp_copy_async(
         "- Never use the first person.\n"
         "- Do not address the reader directly (no second person).\n"
         "- Do not use these words anywhere: You, visitor, visitors, located, feature, featured, showcase, blend, period, accessible.\n"
-        "- Do not use em/en dash characters: — or –. If you want that pause, rewrite with commas or parentheses.\n"
+        "- Do not use em/en dash characters: — or –, except if they are part of the official exhibition title or venue name.\n"
         "- Do not include citations, links, or URLs.\n"
         "- Do not mention the exhibition dates anywhere.\n"
         "- Do not mention the visit duration/time-to-spend anywhere.\n"
         "- Spell out numbers one to ten in words (no digits 1–10).\n"
-        "- Do not include the venue’s postal address (no street, postcode, or 'address is …').\n\n"
+        "- Do not include the venue’s postal address (no street, postcode, or 'address is …').\n"
+        f"- When mentioning the venue name in the copy, always write it with a leading 'The' (capital T), matching: {venue_for_copy}.\n\n"
         "LONG (HTML)\n"
-        "- 350 to 400 words. Target 380–395 words.\n"
-        "- If you are under 350 words, add one more factual sentence to reach the minimum.\n"
+        "- Aim for 350 words.\n"
         "- Multiple paragraphs; wrap each paragraph in <p> tags.\n"
-        "- Do not begin with the exhibition name or 'this exhibition'.\n"
-        f"- Start the long description (immediately after <p>) with this exact sentence: {required_long_prefix}\n"
-        f"{avoid_long_clause}"
-        "- Avoid concluding sentences.\n"
+        "- Do not begin with the exhibition name, the venue name, or phrases like 'This exhibition'.\n"
+        "- Do not use formula openings such as: Across…, Through…, Inside…, At The venue…, In this show…\n"
+        "- Use an informal, easy to read style.\n"
+        "- Avoid concluding or summary-style final sentences.\n"
+        "OPENING STRATEGY (CRITICAL FOR VARIATION)\n"
+        "- Each exhibition description must open using a different narrative angle.\n"
+        "- Anchor the opening on why the exhibition is worth a visit.\n"
+        "- Do not prioritise the lay out of the exhibition.\n"
+        "- Avoid openings that mention rooms, spaces, galleries, displays, labels, or layout structure.\n"
+        "- Do not reuse opening sentence structure across exhibitions.\n"
+        "- Avoid physical walkthrough descriptions or layout framing.\n"
+        "- Avoid openings about rooms, galleries, spaces, layout, organisation, labels/interpretation panels, or sequences such as first/next/final.\n"
+        + f"{avoid_long_clause}"
         "- Include naturally: one highlight, two don't-miss elements, and one hidden gem.\n"
         "- Mention at least three specific works, artists, or items when possible.\n"
         "- Use strong verbs, concrete nouns, active voice; cut filler.\n"
@@ -1800,11 +3538,21 @@ async def _generate_temp_copy_async(
         "- Must include a verb.\n"
         "- Must not repeat the exhibition name.\n"
         "- Must not repeat the phrasing or start of the long description.\n\n"
-        f"- Start the short description with the exact first word '{required_short_opener}'.\n"
+        "- Do not prioritise the lay out of the exhibition.\n"
+        "- The short description MUST NOT focus on rooms, spaces, galleries, displays, labels, or layout structure.\n"
+        "- Also avoid: exhibition organisation, interpretation panels, sequences such as first/next/final, or physical walkthrough descriptions.\n"
         "- Do not start the short description with 'Explore'.\n"
         f"{avoid_short_clause}"
         "OUTPUT\n"
-        "- Return ONLY a JSON object with exactly the keys 'short' and 'long'.\n"
+        "RATING\n"
+        "- Add a numeric rating for this exhibition (integer 1–4) using this scale:\n"
+        "  4 = must see\n"
+        "  3 = very solid if you care about the field\n"
+        "  2 = niche / depends on your interests\n"
+        "  1 = honestly skippable unless you’re nearby or researching\n"
+        "\n"
+        "OUTPUT\n"
+        "- Return ONLY a JSON object with exactly the keys 'short', 'long', and 'rating'.\n"
         "- Both 'short' and 'long' must be non-empty strings.\n"
     )
 
@@ -1842,8 +3590,9 @@ async def _generate_temp_copy_async(
                                 "properties": {
                                     "short": {"type": "string"},
                                     "long": {"type": "string"},
+                                    "rating": {"type": "integer", "enum": [1, 2, 3, 4]},
                                 },
-                                "required": ["short", "long"],
+                                "required": ["short", "long", "rating"],
                             },
                         },
                     },
@@ -1885,32 +3634,28 @@ async def _generate_temp_copy_async(
 
         short = str(data.get("short") or "").strip()
         long_html = str(data.get("long") or "").strip()
+        rating_raw = data.get("rating")
+        rating_val: int | None
+        try:
+            rating_val = int(rating_raw) if rating_raw is not None else None
+        except Exception:
+            rating_val = None
         try:
             last_json = json.dumps(
-                {"short": short, "long": long_html}, ensure_ascii=False
+                {"short": short, "long": long_html, "rating": rating_val}, ensure_ascii=False
             )
         except Exception:
             last_json = content[:2000]
 
-        last_violations = _validate_temp_copy(title, short, long_html, address)
-        if required_short_opener:
-            first = (short.split(" ", 1)[0] if short else "").strip()
-            if first != required_short_opener:
-                last_violations.append(
-                    f"short must start with '{required_short_opener}'"
-                )
-        if required_long_prefix and long_html:
-            body = long_html
-            if body.startswith("<p>"):
-                body = body[3:]
-            if not body.startswith(required_long_prefix):
-                last_violations.append(f"long must start with '{required_long_prefix}'")
+        last_violations = _validate_temp_copy(
+            title, venue_for_copy, short, long_html, rating_val, address
+        )
         if long_html and (not best or len(last_violations) < len(best_violations)):
-            best = {"short": short, "long": long_html}
+            best = {"short": short, "long": long_html, "rating": str(rating_val or "")}
             best_violations = last_violations[:]
 
         if not last_violations:
-            return {"short": short, "long": long_html}
+            return {"short": short, "long": long_html, "rating": str(rating_val)}
 
     if best:
         if best_violations:
@@ -2143,6 +3888,12 @@ async def _fetch_temporary_exhibitions_window_async(
     if client is None:
         return []
 
+    hard_max = max(1, int(getattr(settings, "TEMP_HARD_MAX_EXHIBITIONS", 200) or 200))
+    absolute_max_setting = int(getattr(settings, "TEMP_ABSOLUTE_MAX_EXHIBITIONS", 10) or 0)
+    absolute_max = absolute_max_setting if absolute_max_setting > 0 else hard_max
+    if int(target_max) <= 0 or int(target_max) > absolute_max:
+        target_max = absolute_max
+
     today_iso = window_start.isoformat()
     end_iso = window_end.isoformat()
     soon_cutoff = window_start + timedelta(days=30)
@@ -2160,9 +3911,9 @@ async def _fetch_temporary_exhibitions_window_async(
 
     # We always push hard for a full result set. If no explicit cap is provided (target_max<=0),
     # we still enforce a hard safety cap.
-    hard_max = max(1, int(getattr(settings, "TEMP_HARD_MAX_EXHIBITIONS", 200) or 200))
     pass_max = max(5, int(getattr(settings, "TEMP_SEARCH_PASS_MAX_ITEMS", 60) or 60))
     desired_max = int(target_max) if int(target_max) > 0 else hard_max
+    desired_max = min(desired_max, absolute_max)
     desired_min = min(int(getattr(settings, "TEMP_TARGET_MIN_EXHIBITIONS", 15) or 15), desired_max)
     passes = max(1, int(getattr(settings, "TEMP_SEARCH_PASSES", 3) or 3))
     venue_deepen_passes = max(
@@ -2176,33 +3927,10 @@ async def _fetch_temporary_exhibitions_window_async(
     venue_discovery_enabled = int(getattr(settings, "TEMP_VENUE_DISCOVERY_ENABLED", 1) or 0) != 0
     venue_discovery_max = int(getattr(settings, "TEMP_VENUE_DISCOVERY_MAX", 50) or 0)
 
+    # Venue discovery is expensive. Only run it if we still need more exhibitions after the
+    # initial passes/curated phase (see deepening block below).
     venue_discovery_block = ""
     discovered_venues: list[dict[str, str]] = []
-    if venue_discovery_enabled and venue_discovery_max > 0:
-        discovered_venues = await _discover_venues_async(
-            client=client,
-            city=city,
-            country="",
-            use_web_search_tool=use_web_search_tool,
-            max_venues=venue_discovery_max,
-        )
-        if discovered_venues:
-            lines: list[str] = []
-            for it in discovered_venues[: min(venue_discovery_max, 60)]:
-                v = (it.get("venue") or "").strip()
-                u = (it.get("website_url") or "").strip()
-                if not v:
-                    continue
-                if u:
-                    lines.append(f"{v} ({u})")
-                else:
-                    lines.append(v)
-            if lines:
-                venue_discovery_block = (
-                    "Venue discovery seed list (use these to broaden coverage and then find temporary exhibitions at each venue):\n- "
-                    + "\n- ".join(lines)
-                    + "\n\n"
-                )
 
     curated_enabled = int(getattr(settings, "TEMP_CURATED_VENUES_ENABLED", 1) or 0) != 0
     curated_max_venues = int(getattr(settings, "TEMP_CURATED_VENUES_MAX_VENUES", 0) or 0)
@@ -2212,6 +3940,7 @@ async def _fetch_temporary_exhibitions_window_async(
     curated_venues = _dedupe_preserve_order(_CITY_CURATED_VENUES.get(city_norm, []))
     if curated_max_venues > 0:
         curated_venues = curated_venues[:curated_max_venues]
+    curated_only_mode = curated_enabled and bool(curated_venues)
 
     curated_block = ""
     if curated_enabled and curated_venues:
@@ -2378,7 +4107,7 @@ async def _fetch_temporary_exhibitions_window_async(
             pool_max = max(desired_max * 2, desired_max + 10)
 
         logger.info(
-            "temp_search_plan city=%s passes=%s target_min=%s target_max=%s pool_max=%s venue_deepen_passes=%s venue_deepen_max_venues=%s venue_deepen_max_per_venue=%s venue_discovery_enabled=%s",
+            "temp_search_plan city=%s passes=%s target_min=%s target_max=%s pool_max=%s venue_deepen_passes=%s venue_deepen_max_venues=%s venue_deepen_max_per_venue=%s venue_discovery_enabled=%s curated_only_mode=%s",
             city,
             passes,
             desired_min,
@@ -2388,6 +4117,7 @@ async def _fetch_temporary_exhibitions_window_async(
             venue_deepen_max_venues,
             venue_deepen_max_per_venue,
             venue_discovery_enabled,
+            curated_only_mode,
         )
 
         # Phase 0: curated venue list. Query each venue directly to ensure coverage.
@@ -2399,6 +4129,8 @@ async def _fetch_temporary_exhibitions_window_async(
                 curated_max_items_per_venue,
             )
             for venue_name in curated_venues:
+                if int(target_max) > 0 and _kept_estimate_count(combined) >= desired_max:
+                    break
                 if len(combined) >= pool_max:
                     break
                 before_total = len(combined)
@@ -2468,99 +4200,111 @@ async def _fetch_temporary_exhibitions_window_async(
                     f"kept_before={before_kept}",
                 )
 
-        for pass_idx in range(passes):
-            before_total = len(combined)
-            before_kept = _kept_estimate_count(combined)
-            if pass_idx == 0 or not combined:
-                input_prompt = base_prompt
-            else:
-                exclude = []
-                for it in combined[:40]:
-                    exclude.append(
-                        f"{(it.get('venue') or '').strip()} | {(it.get('name') or '').strip()} | {(it.get('start_date') or '').strip()} | {(it.get('end_date') or '').strip()}"
+        # Base passes: stop as soon as we have enough kept items.
+        # For cities with a curated venue list, we intentionally skip broad passes and rely
+        # on the curated venue phase only.
+        if (
+            not curated_only_mode
+            and (int(target_max) <= 0 or _kept_estimate_count(combined) < desired_max)
+        ):
+            for pass_idx in range(passes):
+                before_total = len(combined)
+                before_kept = _kept_estimate_count(combined)
+                if pass_idx == 0 or not combined:
+                    input_prompt = base_prompt
+                else:
+                    exclude = []
+                    for it in combined[:40]:
+                        exclude.append(
+                            f"{(it.get('venue') or '').strip()} | {(it.get('name') or '').strip()} | {(it.get('start_date') or '').strip()} | {(it.get('end_date') or '').strip()}"
+                        )
+                    input_prompt = (
+                        base_prompt
+                        + "\n\nNow find MORE distinct exhibitions under the exact same rules.\n"
+                        + f"- You must add new exhibitions until you reach {desired_max} total, or truly run out.\n"
+                        + "- Do not repeat any exhibitions listed below.\n"
+                        + "\nAlready found (exclude these):\n- "
+                        + "\n- ".join(exclude)
+                        + "\n"
                     )
-                input_prompt = (
-                    base_prompt
-                    + "\n\nNow find MORE distinct exhibitions under the exact same rules.\n"
-                    + f"- You must add new exhibitions until you reach {desired_max} total, or truly run out.\n"
-                    + "- Do not repeat any exhibitions listed below.\n"
-                    + "\nAlready found (exclude these):\n- "
-                    + "\n- ".join(exclude)
-                    + "\n"
-                )
 
-            content = await _run_search_with_retries(input_prompt)
-            last_raw = content or ""
-            logger.debug(
-                "temp_search_raw city=%s pass=%s chars=%s snippet=%r",
-                city,
-                pass_idx + 1,
-                len(content or ""),
-                (content or "")[:1200],
-            )
-            if not content or content.strip() in ("[]", ""):
-                logger.info(
-                    "temp_search_pass city=%s pass=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
-                    city,
-                    pass_idx + 1,
-                    0,
-                    0,
-                    len(combined),
-                    _kept_estimate_count(combined),
-                    "empty",
-                )
-                continue
-
-            data = _extract_json_array(content)
-            if data is None:
+                content = await _run_search_with_retries(input_prompt)
+                last_raw = content or ""
                 logger.debug(
-                    "temp_search_parse_failed city=%s pass=%s raw=%r",
+                    "temp_search_raw city=%s pass=%s chars=%s snippet=%r",
                     city,
                     pass_idx + 1,
-                    (content or "")[:2000],
+                    len(content or ""),
+                    (content or "")[:1200],
                 )
+                if not content or content.strip() in ("[]", ""):
+                    logger.info(
+                        "temp_search_pass city=%s pass=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
+                        city,
+                        pass_idx + 1,
+                        0,
+                        0,
+                        len(combined),
+                        _kept_estimate_count(combined),
+                        "empty",
+                    )
+                    continue
+
+                data = _extract_json_array(content)
+                if data is None:
+                    logger.debug(
+                        "temp_search_parse_failed city=%s pass=%s raw=%r",
+                        city,
+                        pass_idx + 1,
+                        (content or "")[:2000],
+                    )
+                    logger.info(
+                        "temp_search_pass city=%s pass=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
+                        city,
+                        pass_idx + 1,
+                        0,
+                        0,
+                        len(combined),
+                        _kept_estimate_count(combined),
+                        "parse_failed",
+                    )
+                    continue
+
+                logger.debug(
+                    "temp_search_parsed city=%s pass=%s items=%s",
+                    city,
+                    pass_idx + 1,
+                    len(data),
+                )
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    k = _dedupe_exhibition_key(item)
+                    if not k or k in seen:
+                        continue
+                    seen.add(k)
+                    combined.append(item)
+                    if len(combined) >= pool_max:
+                        break
+
+                kept_est = _kept_estimate_count(combined)
+                after_total = len(combined)
+                new_added = max(0, after_total - before_total)
                 logger.info(
                     "temp_search_pass city=%s pass=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
                     city,
                     pass_idx + 1,
-                    0,
-                    0,
-                    len(combined),
-                    _kept_estimate_count(combined),
-                    "parse_failed",
+                    len(data),
+                    new_added,
+                    after_total,
+                    kept_est,
+                    f"kept_before={before_kept}",
                 )
-                continue
-
-            logger.debug("temp_search_parsed city=%s pass=%s items=%s", city, pass_idx + 1, len(data))
-            for item in data:
-                if not isinstance(item, dict):
-                    continue
-                k = _dedupe_exhibition_key(item)
-                if not k or k in seen:
-                    continue
-                seen.add(k)
-                combined.append(item)
+                # If we're uncapped, always run all base passes and just respect the safety pool limit.
+                if int(target_max) > 0 and kept_est >= desired_max:
+                    break
                 if len(combined) >= pool_max:
                     break
-
-            kept_est = _kept_estimate_count(combined)
-            after_total = len(combined)
-            new_added = max(0, after_total - before_total)
-            logger.info(
-                "temp_search_pass city=%s pass=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
-                city,
-                pass_idx + 1,
-                len(data),
-                new_added,
-                after_total,
-                kept_est,
-                f"kept_before={before_kept}",
-            )
-            # If we're uncapped, always run all base passes and just respect the safety pool limit.
-            if int(target_max) > 0 and kept_est >= desired_max:
-                break
-            if len(combined) >= pool_max:
-                break
 
         if not combined:
             logger.debug("temp_search_empty city=%s raw=%r", city, last_raw[:2000])
@@ -2568,10 +4312,25 @@ async def _fetch_temporary_exhibitions_window_async(
 
         # Per-venue deepening: query specific venues to extract additional temporary exhibitions.
         if (
+            not curated_only_mode
+            and (
             venue_deepen_passes > 0
             and len(combined) < pool_max
             and (int(target_max) > 0 and _kept_estimate_count(combined) < desired_max)
+            )
         ):
+            if (
+                venue_discovery_enabled
+                and venue_discovery_max > 0
+                and not discovered_venues
+            ):
+                discovered_venues = await _discover_venues_async(
+                    client=client,
+                    city=city,
+                    country="",
+                    use_web_search_tool=use_web_search_tool,
+                    max_venues=venue_discovery_max,
+                )
             venue_counts: dict[str, int] = {}
             for it in combined:
                 v = (it.get("venue") or "").strip()
@@ -2675,31 +4434,6 @@ async def _fetch_temporary_exhibitions_window_async(
                         "",
                     )
 
-        # Fill missing venue coordinates (best-effort) so missing coords don't reduce usable output.
-        missing = [
-            it
-            for it in combined
-            if not _parse_coord_pair(it.get("latitude"), it.get("longitude"))
-        ]
-        if missing:
-            sem = asyncio.Semaphore(geo_conc)
-
-            async def _fill_one(it: dict) -> None:
-                async with sem:
-                    looked = await _lookup_venue_coords_async(
-                        client=client,
-                        venue=(it.get("venue") or "").strip(),
-                        address=(it.get("address") or "").strip(),
-                        city=(it.get("city") or city).strip(),
-                        country=(it.get("country") or "").strip(),
-                        use_web_search_tool=use_web_search_tool,
-                    )
-                    if looked:
-                        it["latitude"] = looked[0]
-                        it["longitude"] = looked[1]
-
-            await asyncio.gather(*[_fill_one(it) for it in missing[: desired_max * 2]])
-
         logger.debug("temp_search_combined city=%s items=%s", city, len(combined))
 
         filtered: list[dict] = []
@@ -2779,6 +4513,48 @@ async def _fetch_temporary_exhibitions_window_async(
                 )
             filtered = list(by_key.values())
 
+            # Secondary fuzzy dedupe: same venue + same run dates + highly similar titles.
+            # This catches variants like:
+            # "Auguste Bartholdi" vs "Auguste Bartholdi Liberty Enlightening the World".
+            before_fuzzy = len(filtered)
+            filtered = _fuzzy_dedupe_items_same_dates(filtered)
+            if len(filtered) != before_fuzzy:
+                logger.info(
+                    "temp_search_fuzzy_deduped city=%s before=%s after=%s",
+                    city,
+                    before_fuzzy,
+                    len(filtered),
+                )
+
+        # Apply the hard cap early so we don't do hours/coords backfills for items we won't return.
+        if desired_max > 0 and len(filtered) > desired_max:
+            filtered = filtered[:desired_max]
+
+        # Fill missing venue coordinates (best-effort) for the kept set only.
+        missing = [
+            it
+            for it in filtered
+            if not _parse_coord_pair(it.get("latitude"), it.get("longitude"))
+        ]
+        if missing:
+            sem = asyncio.Semaphore(geo_conc)
+
+            async def _fill_one(it: dict) -> None:
+                async with sem:
+                    looked = await _lookup_venue_coords_async(
+                        client=client,
+                        venue=(it.get("venue") or "").strip(),
+                        address=(it.get("address") or "").strip(),
+                        city=(it.get("city") or city).strip(),
+                        country=(it.get("country") or "").strip(),
+                        use_web_search_tool=use_web_search_tool,
+                    )
+                    if looked:
+                        it["latitude"] = looked[0]
+                        it["longitude"] = looked[1]
+
+            await asyncio.gather(*[_fill_one(it) for it in missing])
+
         if hours_backfill_enabled and filtered:
             # Only look up venues that have missing opening info. Do this once per venue,
             # then apply across all its exhibitions.
@@ -2855,8 +4631,6 @@ async def _fetch_temporary_exhibitions_window_async(
                 it["open_days"] = ",".join(days)
 
         logger.debug("temp_search_filtered city=%s kept=%s", city, len(filtered))
-        if desired_max > 0 and len(filtered) > desired_max:
-            filtered = filtered[:desired_max]
         return filtered
     except Exception as exc:  # noqa: BLE001
         print("DEBUG _fetch_temporary_exhibitions_window OpenAI error:", repr(exc))
@@ -2894,12 +4668,18 @@ def scrape_temporary_exhibitions(
     start_date=None,
     end_date=None,
     languages: list[str] | None = None,
+    max_exhibitions: int | None = None,
 ) -> pd.DataFrame:
     # `asyncio.run()` cannot be called from inside an existing event loop (e.g. notebooks).
     # This function is called from a FastAPI background thread in `app/ui.py`, so it is safe.
     return asyncio.run(
         scrape_temporary_exhibitions_async(
-            city, months=months, start_date=start_date, end_date=end_date, languages=languages
+            city,
+            months=months,
+            start_date=start_date,
+            end_date=end_date,
+            languages=languages,
+            max_exhibitions=max_exhibitions,
         )
     )
 
@@ -2911,11 +4691,26 @@ async def scrape_temporary_exhibitions_async(
     start_date=None,
     end_date=None,
     languages: list[str] | None = None,
+    max_exhibitions: int | None = None,
 ) -> pd.DataFrame:
     if languages is None:
         languages = LANGUAGES
 
-    target_max = int(getattr(settings, "TEMP_MAX_EXHIBITIONS", 20) or 0)
+    hard_max = max(1, int(getattr(settings, "TEMP_HARD_MAX_EXHIBITIONS", 200) or 200))
+    absolute_max_setting = int(getattr(settings, "TEMP_ABSOLUTE_MAX_EXHIBITIONS", 10) or 0)
+    absolute_max = absolute_max_setting if absolute_max_setting > 0 else hard_max
+    target_max = int(getattr(settings, "TEMP_MAX_EXHIBITIONS", absolute_max) or 0)
+    if target_max <= 0 or target_max > absolute_max:
+        target_max = absolute_max
+    if max_exhibitions is not None:
+        try:
+            per_call = int(max_exhibitions)
+        except Exception:
+            per_call = 0
+        if per_call <= 0:
+            return pd.DataFrame(columns=TEMPORARY_COLUMNS_ORDER)
+        if per_call < target_max:
+            target_max = per_call
     if start_date is not None and end_date is not None:
         try:
             window_start = (
@@ -2953,26 +4748,6 @@ async def scrape_temporary_exhibitions_async(
         max(1, int(getattr(settings, "TEMP_TRANSLATION_CONCURRENCY", 4) or 4))
     )
 
-    used_short_openers: dict[str, int] = {}
-    used_long_prefixes: dict[str, int] = {}
-    per_ex_openers: dict[int, tuple[str, str]] = {}
-    for idx, ex in enumerate(exhibitions):
-        venue = (ex.get("venue") or "").strip()
-        seed = "|".join(
-            [
-                (ex.get("name") or "").strip(),
-                venue,
-                (ex.get("start_date") or "").strip(),
-                (ex.get("end_date") or "").strip(),
-                city,
-            ]
-        )
-        required_short = _pick_required_short_opener(seed=seed, used=used_short_openers)
-        required_long = _pick_required_long_prefix(
-            venue=venue or "the venue", seed=seed, used=used_long_prefixes
-        )
-        per_ex_openers[idx] = (required_short, required_long)
-
     async def _process_exhibition(ex: dict, *, idx: int) -> dict:
         name = (ex.get("name") or "").strip()
         venue = (ex.get("venue") or "").strip()
@@ -2997,25 +4772,17 @@ async def scrape_temporary_exhibitions_async(
         if not opening_hours:
             opening_hours = _VENUE_OPENING_INFO_FALLBACK
 
-        venue = _maybe_prefix_the_venue(venue, country)
-
-        # Best-effort venue image URL (cached). Store as a single URL in the existing column.
-        image_url = await _get_venue_image_url_async(
+        # Best-effort venue image URL + legend (cached).
+        image_meta = await _get_venue_image_meta_async(
             venue=venue, city=ex_city, country=country, source_url=source_url
         )
+        image_url = (image_meta.get("image_url") or "").strip()
+        image_legend = _format_image_legend(image_meta)
 
         title_for_copy = (
             name.split(":", 1)[0].strip()
             if name
             else ", ".join([p for p in [venue, ex_city] if p])
-        )
-
-        required_short_opener, required_long_prefix = per_ex_openers.get(
-            idx,
-            (
-                "Trace",
-                f"Rooms at {venue} map the show’s themes through objects, images, sound and text.",
-            ),
         )
 
         async with copy_sem:
@@ -3030,12 +4797,13 @@ async def scrape_temporary_exhibitions_async(
                 duration=duration_raw or "1.5 hours",
                 avoid_short_openers=None,
                 avoid_long_openers=None,
-                required_short_opener=required_short_opener,
-                required_long_prefix=required_long_prefix,
             )
 
         short_desc = (copy.get("short") or "").strip()
         long_desc = _normalise_html_spacing(copy.get("long") or "")
+        rating = str(copy.get("rating") or "").strip()
+        if rating not in ("1", "2", "3", "4"):
+            rating = "4"
         if not short_desc or not long_desc:
             print(
                 "DEBUG scrape_temporary_exhibitions copy generation failed:",
@@ -3061,7 +4829,6 @@ async def scrape_temporary_exhibitions_async(
             if len(parts) >= 3:
                 venue = parts[-2]
                 ex_city = parts[-1] or ex_city
-        venue = _maybe_prefix_the_venue(venue, country)
 
         city_label = ex_city or city
         cats = f"Top Exhibitions, Arts and Culture, Exhibitions in {city_label}".strip()
@@ -3099,6 +4866,7 @@ async def scrape_temporary_exhibitions_async(
                 base_segments.append(city_label)
         base_joined = ", ".join(base_segments) if base_segments else (city_label or "")
         title = f"{base_joined}: {pretty_range}" if pretty_range else base_joined
+        title = _sanitize_export_title(title)
 
         venue_category_path = ""
         if country and ex_city and venue:
@@ -3107,6 +4875,34 @@ async def scrape_temporary_exhibitions_async(
             venue_category_path = f"{country}, {ex_city}"
 
         duration_val = _normalise_duration_hours(duration_raw) or "1"
+        duration_backfill_enabled = (
+            int(getattr(settings, "TEMP_DURATION_BACKFILL_ENABLED", 1) or 0) != 0
+        )
+        if duration_backfill_enabled and (
+            not duration_raw
+            or duration_raw.strip().lower() in ("1", "1h", "1 hour", "1 hours", "60 minutes", "60 mins")
+            or duration_val == "1"
+        ):
+            try:
+                client = _get_openai_client()
+                if client is not None:
+                    use_web_search_tool = "search-api" not in TEMP_SEARCH_MODEL.lower()
+                    title_guess = (name.split(":", 1)[0] if name else "").strip() or title_for_copy
+                    looked = await _lookup_exhibition_duration_async(
+                        client=client,
+                        title=title_guess,
+                        venue=venue,
+                        city=ex_city,
+                        country=country,
+                        source_url=source_url,
+                        use_web_search_tool=use_web_search_tool,
+                    )
+                    found_raw = (looked or {}).get("duration") or ""
+                    found_norm = _normalise_duration_hours(found_raw)
+                    if found_norm:
+                        duration_val = found_norm
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("temp_duration_backfill_error city=%s err=%r", city, exc)
 
         row = {
             "Name of site, City": title,
@@ -3143,7 +4939,7 @@ async def scrape_temporary_exhibitions_async(
             "Ticket URL": ticket_url,
             "Longitude": longitude,
             "Activity type": "",
-            "Rating": "4",
+            "Rating": rating,
             "Name of site city": title,
             "Name of site city fr": "",
             "Name of site city es": "",
@@ -3158,7 +4954,7 @@ async def scrape_temporary_exhibitions_async(
             "Open days": open_days,
         }
         row["URL of images"] = image_url or ""
-        row["Legends of images"] = ""
+        row["Legends of images"] = image_legend or ""
 
         try:
             async with translation_sem:
@@ -3174,19 +4970,19 @@ async def scrape_temporary_exhibitions_async(
             logger.debug("temp_translation_error city=%s err=%r", city, exc)
             bundle = {lang: {"name": "", "short": "", "long": ""} for lang in languages}
 
-        row["Name of site city fr"] = (
+        row["Name of site city fr"] = _sanitize_export_title(
             bundle.get("fr", {}).get("name") or row["Name of site, City"]
         )
-        row["Name of site city es"] = (
+        row["Name of site city es"] = _sanitize_export_title(
             bundle.get("es", {}).get("name") or row["Name of site, City"]
         )
-        row["Name of site city it"] = (
+        row["Name of site city it"] = _sanitize_export_title(
             bundle.get("it", {}).get("name") or row["Name of site, City"]
         )
-        row["Name of site city ru"] = (
+        row["Name of site city ru"] = _sanitize_export_title(
             bundle.get("ru", {}).get("name") or row["Name of site, City"]
         )
-        row["Name of site city zh"] = (
+        row["Name of site city zh"] = _sanitize_export_title(
             bundle.get("zh-CN", {}).get("name") or row["Name of site, City"]
         )
 
@@ -3222,8 +5018,8 @@ async def scrape_temporary_exhibitions_async(
         if isinstance(res, dict) and res:
             rows.append(res)
 
-    # Final export-stage dedupe: protect against duplicates that slip through due to differing
-    # upstream fields but identical final titles.
+    # Final export-stage dedupe: use a canonical identity key (country/city/venue/title)
+    # so date-string differences do not leak duplicate exhibitions.
     if rows:
         def _score_export_row(r: dict) -> int:
             score = 0
@@ -3241,18 +5037,26 @@ async def scrape_temporary_exhibitions_async(
                 score += 1
             if (r.get("Information") or "").strip():
                 score += 1
+            s = _parse_date(str(r.get("Start date (YYYY-MM-DD)") or "").strip())
+            e = _parse_date(str(r.get("End date (YYYY-MM-DD)") or "").strip())
+            if s:
+                score += 2
+            if e:
+                score += 2
+            if s and e and e >= s:
+                score += 1
             return score
 
-        by_title: dict[str, dict] = {}
+        by_key: dict[str, dict] = {}
         extras: list[dict] = []
         for r in rows:
-            title = (r.get("Name of site, City") or "").strip()
-            if not title:
+            key = _dedupe_export_row_key(r)
+            if not key:
                 extras.append(r)
                 continue
-            existing = by_title.get(title)
+            existing = by_key.get(key)
             if not existing:
-                by_title[title] = r
+                by_key[key] = r
                 continue
             # Keep the better row and fill missing fields from the other.
             a, b = existing, r
@@ -3264,18 +5068,114 @@ async def scrape_temporary_exhibitions_async(
             # Prefer longer address when present.
             if len((other.get("Full address") or "")) > len((merged.get("Full address") or "")):
                 merged["Full address"] = other.get("Full address") or merged.get("Full address")
-            by_title[title] = merged
+            by_key[key] = merged
 
-        if len(by_title) + len(extras) != len(rows):
+        if len(by_key) + len(extras) != len(rows):
             logger.info(
                 "temp_export_deduped city=%s before=%s after=%s",
                 city,
                 len(rows),
-                len(by_title) + len(extras),
+                len(by_key) + len(extras),
             )
-        rows = list(by_title.values()) + extras
+        rows = list(by_key.values()) + extras
+
+        # Secondary fuzzy dedupe for title variants with the same venue + exact run dates.
+        # This protects the final sheet from near-duplicate AI title variants.
+        grouped_rows: dict[str, list[dict]] = {}
+        fuzzy_extras: list[dict] = []
+        for r in rows:
+            label = str(r.get("Name of site, City") or "").strip()
+            title, remainder = _split_exhibition_label(label)
+            title = title or _strip_label_date_suffix(label)
+            venue_label = _strip_label_date_suffix(remainder)
+            venue_key = _canonical_venue_for_similarity(venue_label)
+            city_key = _normalise_for_similarity(str(r.get("Real city") or r.get("City") or "").strip())
+            country_key = _normalise_for_similarity(str(r.get("Country") or "").strip())
+            start_iso, end_iso = _stable_date_pair_strings(
+                str(r.get("Start date (YYYY-MM-DD)") or "").strip(),
+                str(r.get("End date (YYYY-MM-DD)") or "").strip(),
+            )
+            if not (title and venue_key and start_iso and end_iso):
+                fuzzy_extras.append(r)
+                continue
+            group_key = "|".join([country_key, city_key, venue_key, start_iso, end_iso])
+            grouped_rows.setdefault(group_key, []).append(r)
+
+        before_fuzzy = len(rows)
+        fuzzy_rows: list[dict] = []
+        date_only = int(getattr(settings, "TEMP_DEDUPE_BY_VENUE_DATES_ONLY", 0) or 0) != 0
+        for group in grouped_rows.values():
+            if date_only:
+                ordered = sorted(group, key=_score_export_row, reverse=True)
+                kept_by_first: dict[str, dict] = {}
+                for pos, cand in enumerate(ordered):
+                    cand_label = str(cand.get("Name of site, City") or "").strip()
+                    cand_title, _ = _split_exhibition_label(cand_label)
+                    cand_title = cand_title or _strip_label_date_suffix(cand_label)
+                    first_key = _first_title_token_for_dedupe(cand_title) or f"__row_{pos}"
+                    existing = kept_by_first.get(first_key)
+                    if not existing:
+                        kept_by_first[first_key] = cand
+                        continue
+                    a, b = existing, cand
+                    best, other = (b, a) if _score_export_row(b) > _score_export_row(a) else (a, b)
+                    merged = dict(best)
+                    for k, v in other.items():
+                        if k not in merged or merged.get(k) in ("", None):
+                            merged[k] = v
+                    if len((other.get("Full address") or "")) > len((merged.get("Full address") or "")):
+                        merged["Full address"] = other.get("Full address") or merged.get("Full address")
+                    kept_by_first[first_key] = merged
+                fuzzy_rows.extend(kept_by_first.values())
+                continue
+            ordered = sorted(group, key=_score_export_row, reverse=True)
+            kept: list[dict] = []
+            for cand in ordered:
+                cand_label = str(cand.get("Name of site, City") or "").strip()
+                cand_title, _ = _split_exhibition_label(cand_label)
+                cand_title = cand_title or _strip_label_date_suffix(cand_label)
+                dup_idx = -1
+                for idx, existing in enumerate(kept):
+                    ex_label = str(existing.get("Name of site, City") or "").strip()
+                    ex_title, _ = _split_exhibition_label(ex_label)
+                    ex_title = ex_title or _strip_label_date_suffix(ex_label)
+                    if _titles_likely_same_exhibition(cand_title, ex_title):
+                        dup_idx = idx
+                        break
+                if dup_idx < 0:
+                    kept.append(cand)
+                else:
+                    a, b = kept[dup_idx], cand
+                    best, other = (b, a) if _score_export_row(b) > _score_export_row(a) else (a, b)
+                    merged = dict(best)
+                    for k, v in other.items():
+                        if k not in merged or merged.get(k) in ("", None):
+                            merged[k] = v
+                    if len((other.get("Full address") or "")) > len((merged.get("Full address") or "")):
+                        merged["Full address"] = other.get("Full address") or merged.get("Full address")
+                    kept[dup_idx] = merged
+            fuzzy_rows.extend(kept)
+        rows = fuzzy_rows + fuzzy_extras
+        if len(rows) != before_fuzzy:
+            logger.info(
+                "temp_export_fuzzy_deduped city=%s before=%s after=%s",
+                city,
+                before_fuzzy,
+                len(rows),
+            )
 
     df = pd.DataFrame(rows)
+    for title_col in (
+        "Name of site, City",
+        "Name of site city",
+        "Name of site city fr",
+        "Name of site city es",
+        "Name of site city it",
+        "Name of site city ru",
+        "Name of site city zh",
+    ):
+        if title_col in df.columns:
+            df[title_col] = df[title_col].map(_sanitize_export_title)
     for col in TEMPORARY_COLUMNS_ORDER:
         if col not in df:
             df[col] = ""
@@ -3283,8 +5183,28 @@ async def scrape_temporary_exhibitions_async(
 
 
 def scrape_destinations_temp(cities: list[str], months: int = 24) -> str:
-    frames = [scrape_temporary_exhibitions(c, months=months) for c in cities]
-    df = pd.concat(frames, ignore_index=True)
+    hard_max = max(1, int(getattr(settings, "TEMP_HARD_MAX_EXHIBITIONS", 200) or 200))
+    absolute_total_setting = int(
+        getattr(settings, "TEMP_ABSOLUTE_MAX_TOTAL_EXHIBITIONS", 10) or 0
+    )
+    absolute_total = absolute_total_setting if absolute_total_setting > 0 else hard_max
+    total_max = int(getattr(settings, "TEMP_TOTAL_MAX_EXHIBITIONS", absolute_total) or 0)
+    if total_max <= 0 or total_max > absolute_total:
+        total_max = absolute_total
+
+    remaining = total_max
+    frames: list[pd.DataFrame] = []
+    for c in cities:
+        if remaining <= 0:
+            break
+        df_city = scrape_temporary_exhibitions(c, months=months, max_exhibitions=remaining)
+        frames.append(df_city)
+        try:
+            remaining -= int(len(df_city.index))
+        except Exception:
+            pass
+
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     Path(settings.RESULT_DIR).mkdir(parents=True, exist_ok=True)
     out_path = Path(settings.RESULT_DIR) / f"{uuid.uuid4()}_places.xlsx"
 

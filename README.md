@@ -17,6 +17,11 @@ PYTHONPATH=. python3 -m app.cli_scraper_temp cities.txt --months 24
 - `--months`: months from today to search (default 24).
 - `--output`: optional path for the Excel output; otherwise `data/<uuid>_places.xlsx` is used.
 
+## Run: Web UI (FastAPI)
+```bash
+PYTHONPATH=. python3 -m uvicorn app.ui:app --reload --port 8000
+```
+
 ## Output
 - An Excel file with exhibitions plus a combinations sheet (date rows per exhibition). Path is printed when done.
 - Descriptions follow the prompt constraints (informal tone, British English, 350–400 word long description, short description ≤164 chars with a verb, etc.).
@@ -27,6 +32,8 @@ PYTHONPATH=. python3 -m app.cli_scraper_temp cities.txt --months 24
 
 ### Tuning (optional)
 - Target count: `TEMP_TARGET_MIN_EXHIBITIONS` / `TEMP_TARGET_MAX_EXHIBITIONS`
+- Hard cap total (multi-city runs): `TEMP_TOTAL_MAX_EXHIBITIONS` (also clamped by `TEMP_ABSOLUTE_MAX_TOTAL_EXHIBITIONS`)
+- Hard cap per city: `TEMP_MAX_EXHIBITIONS` (also clamped by `TEMP_ABSOLUTE_MAX_EXHIBITIONS`, and by the remaining global total)
 - Search passes: `TEMP_SEARCH_PASSES` (default 3)
 - Venue discovery: `TEMP_VENUE_DISCOVERY_ENABLED=1`, `TEMP_VENUE_DISCOVERY_MAX=50`
 - Per-venue deepening: `TEMP_VENUE_DEEPEN_PASSES`, `TEMP_VENUE_DEEPEN_MAX_VENUES`, `TEMP_VENUE_DEEPEN_MAX_PER_VENUE`

@@ -1,0 +1,26 @@
+{
+  "source": "data/latest france run fixed bugs.xlsx",
+  "output": "data/latest france run fixed bugs_deduped_firstword_en.xlsx",
+  "log": "data/latest france run fixed bugs_dedupe_log_firstword_en.csv",
+  "rows_before": 163,
+  "rows_after": 134,
+  "rows_removed": 29,
+  "removed_groups": 21,
+  "top_first_words_removed": {
+    "renoir": 3,
+    "martin": 2,
+    "jo": 2,
+    "youssef": 2,
+    "auguste": 2,
+    "jenny": 2,
+    "mary": 2,
+    "transparency": 1,
+    "nan": 1,
+    "matisse": 1,
+    "china": 1,
+    "day": 1,
+    "joel": 1,
+    "michel": 1,
+    "statue": 1
+  }
+}
