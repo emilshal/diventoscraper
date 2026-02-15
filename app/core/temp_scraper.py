@@ -407,6 +407,26 @@ _CITY_CURATED_VENUES: dict[str, list[str]] = {
         # Kept as provided, but note: "MIM" is also used for Brussels; verify the intended Lisbon venue name if needed.
         "Musical Instruments Museum (MIM)",
     ],
+    # User-provided curated venue list (Milan, IT).
+    "milan": [
+        "Pinacoteca di Brera",
+        "Palazzo Reale",
+        "Fondazione Prada",
+        "Triennale Milano",
+        "Museo del Novecento",
+        "PAC – Padiglione d’Arte Contemporanea",
+        "Mudec – Museo delle Culture",
+        "Castello Sforzesco",
+        "Gallerie d’Italia",
+        "Museo Poldi Pezzoli",
+        "Museo Bagatti Valsecchi",
+        "Museo del Duomo di Milano",
+        "Pinacoteca Ambrosiana",
+        "Casa Museo Boschi Di Stefano",
+        "Museo del Design ADI",
+        "Museo Nazionale della Scienza e della Tecnologia Leonardo da Vinci",
+        "Museo Archeologico di Milano",
+    ],
 }
 
 
@@ -2005,6 +2025,18 @@ def _maybe_fix_image_meta(meta: dict[str, str]) -> dict[str, str]:
     return meta
 
 
+def _is_placeholder_image_url(url: str) -> bool:
+    u = (url or "").strip().lower()
+    if not u:
+        return True
+    fallback = str(getattr(settings, "TEMP_IMAGE_FALLBACK_URL", "") or "").strip().lower()
+    if fallback and u == fallback:
+        return True
+    if "placehold.co" in u and "divento" in u:
+        return True
+    return False
+
+
 def _google_favicon_url(domain: str, *, size: int) -> str:
     d = (domain or "").strip()
     if not d:
@@ -2758,7 +2790,10 @@ async def _find_generic_venue_image_meta_async(
             "credit": str(data.get("credit") or "").strip(),
             "mode": "venue_fallback",
         }
-        return _maybe_fix_image_meta(meta)
+        meta = _maybe_fix_image_meta(meta)
+        if not meta.get("image_url") or _is_placeholder_image_url(str(meta.get("image_url") or "")):
+            return None
+        return meta
     except Exception as exc:  # noqa: BLE001
         logger.debug(
             "temp_generic_venue_image_search_error venue=%s city=%s country=%s err=%r",
@@ -2768,6 +2803,41 @@ async def _find_generic_venue_image_meta_async(
             exc,
         )
         return None
+
+
+async def _find_generic_venue_image_meta_multi_async(
+    *,
+    client: AsyncOpenAI,
+    venue: str,
+    city: str,
+    country: str,
+    use_web_search_tool: bool,
+) -> dict[str, str] | None:
+    venue_variants = _dedupe_preserve_order([
+        str(venue or "").strip(),
+        str(venue or "").split(",", 1)[0].strip(),
+        re.sub(r"\s*\(.*?\)\s*", " ", str(venue or "")).strip(),
+    ])
+    locality_variants = _dedupe_preserve_order([
+        (str(city or "").strip(), str(country or "").strip()),
+        (str(city or "").strip(), ""),
+        ("", str(country or "").strip()),
+    ])
+
+    for venue_variant in venue_variants:
+        if not venue_variant:
+            continue
+        for city_variant, country_variant in locality_variants:
+            found = await _find_generic_venue_image_meta_async(
+                client=client,
+                venue=venue_variant,
+                city=city_variant,
+                country=country_variant,
+                use_web_search_tool=use_web_search_tool,
+            )
+            if found and found.get("image_url") and not _is_placeholder_image_url(str(found.get("image_url") or "")):
+                return found
+    return None
 
 
 async def _discover_venues_async(
@@ -3076,7 +3146,7 @@ async def _get_venue_image_meta_async(
                     _TEMP_VENUE_IMAGE_CACHE[cache_key] = meta["image_url"]
                 return meta
             # If strict reusable search fails, try a generic venue photo before placeholder.
-            generic = await _find_generic_venue_image_meta_async(
+            generic = await _find_generic_venue_image_meta_multi_async(
                 client=client,
                 venue=venue,
                 city=city,
@@ -3260,6 +3330,20 @@ async def _get_venue_image_meta_async(
             "rights": "",
             "mode": "soft_fallback",
         })
+        if _is_placeholder_image_url(str(meta.get("image_url") or "")):
+            generic = None
+            client = _get_openai_client()
+            if client is not None:
+                use_web_search_tool = "search-api" not in TEMP_SEARCH_MODEL.lower()
+                generic = await _find_generic_venue_image_meta_multi_async(
+                    client=client,
+                    venue=venue,
+                    city=city,
+                    country=country,
+                    use_web_search_tool=use_web_search_tool,
+                )
+            if generic and generic.get("image_url"):
+                meta = generic
         meta = await _enrich_image_rights_meta_async(
             meta=meta,
             venue=venue,
@@ -3275,7 +3359,7 @@ async def _get_venue_image_meta_async(
         client = _get_openai_client()
         if client is not None:
             use_web_search_tool = "search-api" not in TEMP_SEARCH_MODEL.lower()
-            generic = await _find_generic_venue_image_meta_async(
+            generic = await _find_generic_venue_image_meta_multi_async(
                 client=client,
                 venue=venue,
                 city=city,
