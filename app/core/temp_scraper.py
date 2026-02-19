@@ -1928,6 +1928,54 @@ def _is_icon_like_image_url(url: str) -> bool:
     return any(marker in path for marker in icon_markers)
 
 
+def _is_small_image_url(url: str, *, min_px: int = 600) -> bool:
+    u = (url or "").strip().lower()
+    if not u:
+        return False
+    try:
+        parsed = urlparse(u)
+        path = unquote(parsed.path or "").lower()
+        query = parse_qs(parsed.query or "")
+    except Exception:
+        path = u
+        query = {}
+
+    for m in re.finditer(r"(\d{2,4})x(\d{2,4})", path):
+        try:
+            w = int(m.group(1))
+            h = int(m.group(2))
+            if w < min_px or h < min_px:
+                return True
+        except Exception:
+            continue
+
+    for k in ("w", "width", "h", "height"):
+        vals = query.get(k) or []
+        for v in vals:
+            try:
+                if int(str(v).strip()) < min_px:
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _wp_thumbnail_to_original(url: str) -> str:
+    u = (url or "").strip()
+    if not u:
+        return ""
+    try:
+        parsed = urlparse(u)
+        path = parsed.path or ""
+        # Typical WP resized assets: image-300x200.jpg -> image.jpg
+        orig_path = re.sub(r"-\d{2,4}x\d{2,4}(?=\.[a-z0-9]{3,5}$)", "", path, flags=re.I)
+        if orig_path == path:
+            return ""
+        return parsed._replace(path=orig_path).geturl()
+    except Exception:
+        return ""
+
+
 def _domain_from_url(url: str) -> str:
     try:
         return urlparse(url).netloc or ""
@@ -1939,6 +1987,10 @@ def _is_image_url_ok(url: str) -> bool:
     if not url:
         return False
     if _is_svg_image_url(url):
+        return False
+    if _is_icon_like_image_url(url):
+        return False
+    if _is_small_image_url(url):
         return False
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
@@ -1960,6 +2012,119 @@ def _is_image_url_ok(url: str) -> bool:
     except Exception:
         return False
     return False
+
+
+def _is_image_url_ok_relaxed(url: str) -> bool:
+    if not url:
+        return False
+    if _is_svg_image_url(url):
+        return False
+    if _is_icon_like_image_url(url):
+        return False
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        r = requests.head(url, timeout=8, allow_redirects=True, headers=headers)
+        ct = (r.headers.get("Content-Type") or "").lower()
+        if "image/svg+xml" in ct:
+            return False
+        if r.status_code == 200 and ct.startswith("image/"):
+            return True
+    except Exception:
+        pass
+    try:
+        r = requests.get(url, timeout=10, allow_redirects=True, headers=headers, stream=True)
+        ct = (r.headers.get("Content-Type") or "").lower()
+        if "image/svg+xml" in ct:
+            return False
+        if r.status_code == 200 and ct.startswith("image/"):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+async def _find_relaxed_venue_image_meta_async(
+    *,
+    client: AsyncOpenAI | None,
+    venue: str,
+    city: str,
+    country: str,
+    source_url: str,
+    homepage: str,
+) -> dict[str, str] | None:
+    candidates: list[tuple[str, str]] = []
+    page_a = source_url or ""
+    page_b = homepage or ""
+
+    if page_a:
+        html_a = await asyncio.to_thread(_fetch_url_text, page_a)
+        candidates.append((_normalise_http_url(_extract_meta_image_url(html_a), base_url=page_a), page_a))
+    if page_b and page_b != page_a:
+        html_b = await asyncio.to_thread(_fetch_url_text, page_b)
+        candidates.append((_normalise_http_url(_extract_meta_image_url(html_b), base_url=page_b), page_b))
+
+    if client is not None:
+        use_web_search_tool = "search-api" not in TEMP_SEARCH_MODEL.lower()
+        tools = [{"type": "web_search"}] if use_web_search_tool else None
+        prompt = (
+            "Find any usable image URL for this venue (exhibition visual preferred, venue photo otherwise).\n"
+            "Return ONLY JSON with keys: image_url, page_url.\n"
+            "Rules:\n"
+            "- Hard reject favicon/logo/icon assets.\n"
+            "- Direct image URL preferred.\n"
+            "- If only a smaller image is available, it is acceptable as a last resort.\n"
+            "- If no usable image exists, return empty strings.\n\n"
+            f"Venue: {venue}\nCity: {city}\nCountry: {country}\n"
+        )
+        try:
+            resp = await _call_with_backoff(
+                lambda: client.responses.create(
+                    model=TEMP_SEARCH_MODEL,
+                    input=prompt,
+                    tools=tools,
+                    max_output_tokens=400,
+                ),
+                max_attempts=2,
+            )
+            content = _clean_json_content(resp.output_text or _extract_response_text(resp) or "")
+            data = _extract_json_object(content) if content else None
+            if isinstance(data, dict):
+                img = _normalise_http_url(str(data.get("image_url") or ""), base_url="")
+                page = _normalise_http_url(str(data.get("page_url") or ""), base_url="")
+                candidates.append((img, page))
+        except Exception:
+            pass
+
+    seen: set[str] = set()
+    for img, page in candidates:
+        url = (img or "").strip()
+        if not url:
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        wp_original = _wp_thumbnail_to_original(url)
+        if wp_original and _is_image_url_ok_relaxed(wp_original):
+            return {
+                "image_url": wp_original,
+                "page_url": page or "",
+                "license": "",
+                "license_url": "",
+                "credit": "",
+                "rights": "Venue fallback image (quality checks relaxed)",
+                "mode": "venue_relaxed_fallback",
+            }
+        if _is_image_url_ok_relaxed(url):
+            return {
+                "image_url": url,
+                "page_url": page or "",
+                "license": "",
+                "license_url": "",
+                "credit": "",
+                "rights": "Venue fallback image (quality checks relaxed)",
+                "mode": "venue_relaxed_fallback",
+            }
+    return None
 
 
 def _commons_image_url_from_page(page_url: str) -> str:
@@ -2011,6 +2176,11 @@ def _maybe_fix_image_meta(meta: dict[str, str]) -> dict[str, str]:
     if "commons.wikimedia.org/wiki/File:" in img and not page:
         page = img
         meta["page_url"] = page
+    # If this looks like a WordPress thumbnail, try the original-sized path first.
+    wp_original = _wp_thumbnail_to_original(img)
+    if wp_original and _is_image_url_ok(wp_original):
+        meta["image_url"] = wp_original
+        return meta
     if _is_image_url_ok(img):
         return meta
     # Try to resolve Commons file page -> direct upload URL.
@@ -2676,6 +2846,9 @@ async def _find_reusable_venue_image_async(
         "Rules:\n"
         "- The image MUST be allowed for reuse under a permissive license.\n"
         "- Prefer sources with explicit licensing info like Wikimedia Commons or Europeana.\n"
+        "- Hard reject favicon/logo/icon assets.\n"
+        "- Hard reject small images where width or height is under ~600px.\n"
+        "- If you find a WordPress-style thumbnail URL (e.g. *-300x200.jpg), try the original-size version first.\n"
         "- license should be something like 'CC0', 'Public Domain', 'CC BY 4.0', 'CC BY-SA 4.0'.\n"
         "- license_url must link to the license page (or the image page section that clearly states the license).\n"
         "- credit must be a short attribution string suitable for publication when required (author/creator if shown, plus source).\n"
@@ -2705,6 +2878,11 @@ async def _find_reusable_venue_image_async(
         lic_url = _normalise_http_url(str(data.get("license_url") or ""), base_url=page)
         credit = str(data.get("credit") or "").strip()
         if not img or not page:
+            return None
+        wp_original = _wp_thumbnail_to_original(img)
+        if wp_original and _is_image_url_ok(wp_original):
+            img = wp_original
+        if not _is_image_url_ok(img):
             return None
         domain = _domain_from_url(page)
         if allowed_domains and not _domain_matches_any(domain, allowed_domains):
@@ -2747,8 +2925,11 @@ async def _find_generic_venue_image_meta_async(
         "Find a photo image URL of the venue building/interior for this museum/gallery.\n"
         "Return ONLY JSON with keys: image_url, page_url, license, license_url, credit.\n"
         "Rules:\n"
-        "- Do NOT require this to be about a specific exhibition.\n"
-        "- Do NOT return exhibition posters/banners/artwork crops when a venue photo is available.\n"
+        "- Prefer a currently relevant exhibition image (poster/hero/banner) for this venue when available.\n"
+        "- If no suitable exhibition image is found, fall back to a venue building/interior photo.\n"
+        "- Hard reject favicon/logo/icon assets.\n"
+        "- Hard reject small images where width or height is under ~600px.\n"
+        "- If you find a WordPress-style thumbnail URL (e.g. *-300x200.jpg), try the original-size version first.\n"
         "- Prefer official venue pages, Wikimedia Commons, or other public pages.\n"
         "- Avoid press-login pages and ticketing overlays.\n"
         "- image_url must be a direct image URL (jpg/png/webp) when possible.\n"
@@ -2818,11 +2999,22 @@ async def _find_generic_venue_image_meta_multi_async(
         str(venue or "").split(",", 1)[0].strip(),
         re.sub(r"\s*\(.*?\)\s*", " ", str(venue or "")).strip(),
     ])
-    locality_variants = _dedupe_preserve_order([
+    raw_locality_variants = [
         (str(city or "").strip(), str(country or "").strip()),
         (str(city or "").strip(), ""),
         ("", str(country or "").strip()),
-    ])
+    ]
+    locality_variants: list[tuple[str, str]] = []
+    seen_locality: set[tuple[str, str]] = set()
+    for city_variant, country_variant in raw_locality_variants:
+        key = (
+            _normalise_for_dedupe(city_variant),
+            _normalise_for_dedupe(country_variant),
+        )
+        if key in seen_locality:
+            continue
+        seen_locality.add(key)
+        locality_variants.append((city_variant, country_variant))
 
     for venue_variant in venue_variants:
         if not venue_variant:
@@ -3141,10 +3333,11 @@ async def _get_venue_image_meta_async(
                     meta.get("license") or "",
                 )
                 meta = _maybe_fix_image_meta(meta)
-                if cache_key:
-                    _TEMP_IMAGE_LICENSE_CACHE[cache_key] = dict(meta)
-                    _TEMP_VENUE_IMAGE_CACHE[cache_key] = meta["image_url"]
-                return meta
+                if not _is_placeholder_image_url(str(meta.get("image_url") or "")):
+                    if cache_key:
+                        _TEMP_IMAGE_LICENSE_CACHE[cache_key] = dict(meta)
+                        _TEMP_VENUE_IMAGE_CACHE[cache_key] = meta["image_url"]
+                    return meta
             # If strict reusable search fails, try a generic venue photo before placeholder.
             generic = await _find_generic_venue_image_meta_multi_async(
                 client=client,
@@ -3256,14 +3449,19 @@ async def _get_venue_image_meta_async(
                         "mode": "soft",
                     }
                     meta = _maybe_fix_image_meta(meta)
-                    if cache_key:
-                        _TEMP_IMAGE_LICENSE_CACHE[cache_key] = dict(meta)
-                        _TEMP_VENUE_IMAGE_CACHE[cache_key] = meta["image_url"]
-                    return meta
+                    if not _is_placeholder_image_url(str(meta.get("image_url") or "")):
+                        if cache_key:
+                            _TEMP_IMAGE_LICENSE_CACHE[cache_key] = dict(meta)
+                            _TEMP_VENUE_IMAGE_CACHE[cache_key] = meta["image_url"]
+                        return meta
             prompt = (
                 "Find a public, non-press venue photo image URL for this museum/gallery.\n"
                 "Return ONLY JSON with keys: image_url, page_url.\n"
-                "- Do NOT return exhibition posters/banners/artwork crops when a venue photo is available.\n"
+                "- Prefer a currently relevant exhibition image (poster/hero/banner) for this venue when available.\n"
+                "- If no suitable exhibition image is found, fall back to a venue building/interior photo.\n"
+                "- Hard reject favicon/logo/icon assets.\n"
+                "- Hard reject small images where width or height is under ~600px.\n"
+                "- If you find a WordPress-style thumbnail URL (e.g. *-300x200.jpg), try the original-size version first.\n"
                 "- Prefer the official venue website.\n"
                 "- Do not use press login/press kit pages.\n"
                 "- image_url must be a direct image URL (jpg/png/webp).\n"
@@ -3386,6 +3584,34 @@ async def _get_venue_image_meta_async(
                 "credit": "",
                 "mode": "fallback",
             })
+
+    if _is_placeholder_image_url(str(meta.get("image_url") or "")):
+        client = _get_openai_client()
+        relaxed = await _find_relaxed_venue_image_meta_async(
+            client=client,
+            venue=venue,
+            city=city,
+            country=country,
+            source_url=source_url,
+            homepage=homepage,
+        )
+        if relaxed and relaxed.get("image_url"):
+            meta = await _enrich_image_rights_meta_async(
+                meta=relaxed,
+                venue=venue,
+                city=city,
+                country=country,
+                source_url=source_url,
+            )
+            if not (meta.get("rights") or meta.get("license")):
+                meta["rights"] = "Venue fallback image (quality checks relaxed)"
+            logger.info(
+                "temp_image_selected mode=venue_relaxed_fallback venue=%s city=%s country=%s image=%s",
+                venue,
+                city,
+                country,
+                meta.get("image_url") or "",
+            )
 
     if cache_key:
         _TEMP_IMAGE_LICENSE_CACHE[cache_key] = dict(meta)
