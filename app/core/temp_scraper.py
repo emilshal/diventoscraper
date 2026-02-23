@@ -2830,6 +2830,7 @@ async def _find_reusable_venue_image_async(
     city: str,
     country: str,
     use_web_search_tool: bool,
+    exhibition_title: str = "",
 ) -> dict[str, str] | None:
     """
     Best-effort search for a venue image with explicit reuse-friendly licensing signals.
@@ -2840,11 +2841,16 @@ async def _find_reusable_venue_image_async(
     allowed_domains = _csv_to_set(
         getattr(settings, "TEMP_IMAGE_ALLOWED_SOURCE_DOMAINS", "") or ""
     )
+    exhibition_line = (
+        f"Exhibition title: {exhibition_title}\n" if exhibition_title else ""
+    )
     prompt = (
         "Find a reusable image for this museum/gallery venue.\n"
         "Return ONLY JSON with keys: image_url, page_url, license, license_url, credit.\n"
         "Rules:\n"
         "- The image MUST be allowed for reuse under a permissive license.\n"
+        "- If an exhibition title is provided, prioritise an image that clearly matches that specific exhibition.\n"
+        "- Otherwise, fall back to a reusable venue image.\n"
         "- Prefer sources with explicit licensing info like Wikimedia Commons or Europeana.\n"
         "- Hard reject favicon/logo/icon assets.\n"
         "- Hard reject small images where width or height is under ~600px.\n"
@@ -2854,6 +2860,7 @@ async def _find_reusable_venue_image_async(
         "- credit must be a short attribution string suitable for publication when required (author/creator if shown, plus source).\n"
         "- image_url must be a direct image URL (jpg/png/webp).\n"
         "- If you cannot find a clearly reusable image, return empty strings for all keys.\n\n"
+        f"{exhibition_line}"
         f"Venue: {venue}\nCity: {city}\nCountry: {country}\n"
         f"Allowed license keywords: {', '.join(sorted(allowed_kw)) or '(none)'}\n"
         f"Preferred source domains: {', '.join(sorted(allowed_domains)) or '(none)'}\n"
@@ -3032,6 +3039,83 @@ async def _find_generic_venue_image_meta_multi_async(
     return None
 
 
+async def _find_exhibition_specific_image_meta_async(
+    *,
+    client: AsyncOpenAI,
+    exhibition_title: str,
+    venue: str,
+    city: str,
+    country: str,
+    source_url: str,
+    use_web_search_tool: bool,
+) -> dict[str, str] | None:
+    tools = [{"type": "web_search"}] if use_web_search_tool else None
+    prompt = (
+        "Find an image for this specific exhibition (not a generic venue image unless nothing else exists).\n"
+        "Return ONLY JSON with keys: image_url, page_url, license, license_url, credit.\n"
+        "Rules:\n"
+        "- Prioritise this exact exhibition title at the specified venue/city.\n"
+        "- Prefer the official exhibition page or official museum pages first.\n"
+        "- If not available, use reputable pages that clearly match this same exhibition.\n"
+        "- Hard reject favicon/logo/icon assets.\n"
+        "- Hard reject small images where width or height is under ~600px.\n"
+        "- If you find a WordPress-style thumbnail URL (e.g. *-300x200.jpg), try the original-size version first.\n"
+        "- image_url must be a direct image URL (jpg/png/webp) when possible.\n"
+        "- If nothing valid is found for this exhibition, return empty strings.\n\n"
+        f"Exhibition title: {exhibition_title}\n"
+        f"Venue: {venue}\nCity: {city}\nCountry: {country}\n"
+        f"Known source_url (may help): {source_url}\n"
+    )
+    try:
+        resp = await _call_with_backoff(
+            lambda: client.responses.create(
+                model=TEMP_SEARCH_MODEL,
+                input=prompt,
+                tools=tools,
+                max_output_tokens=700,
+            ),
+            max_attempts=3,
+        )
+        content = _clean_json_content(resp.output_text or _extract_response_text(resp) or "")
+        data = _extract_json_object(content) if content else None
+        if not isinstance(data, dict):
+            return None
+        img = _normalise_http_url(str(data.get("image_url") or ""), base_url="")
+        page = _normalise_http_url(str(data.get("page_url") or ""), base_url="")
+        if not img and page:
+            html_page = await asyncio.to_thread(_fetch_url_text, page)
+            img = _normalise_http_url(_extract_meta_image_url(html_page), base_url=page)
+        if not img:
+            return None
+        wp_original = _wp_thumbnail_to_original(img)
+        if wp_original and _is_image_url_ok(wp_original):
+            img = wp_original
+        if not _is_image_url_ok(img):
+            return None
+        meta = {
+            "image_url": img,
+            "page_url": page,
+            "license": str(data.get("license") or "").strip(),
+            "license_url": _normalise_http_url(str(data.get("license_url") or ""), base_url=page),
+            "credit": str(data.get("credit") or "").strip(),
+            "mode": "exhibition_web_search",
+        }
+        meta = _maybe_fix_image_meta(meta)
+        if not meta.get("image_url") or _is_placeholder_image_url(str(meta.get("image_url") or "")):
+            return None
+        return meta
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "temp_exhibition_image_search_error title=%s venue=%s city=%s country=%s err=%r",
+            exhibition_title,
+            venue,
+            city,
+            country,
+            exc,
+        )
+        return None
+
+
 async def _discover_venues_async(
     *,
     client: AsyncOpenAI,
@@ -3160,6 +3244,7 @@ async def _get_venue_image_url_async(
                 city=city,
                 country=country,
                 use_web_search_tool=use_web_search_tool,
+                exhibition_title=exhibition_title,
             )
             if found and found.get("image_url"):
                 img = found["image_url"]
@@ -3228,6 +3313,7 @@ async def _get_venue_image_url_async(
                     city=city,
                     country=country,
                     use_web_search_tool=use_web_search_tool,
+                    exhibition_title=exhibition_title,
                 )
                 if found and found.get("image_url"):
                     img = found["image_url"]
@@ -3286,14 +3372,30 @@ async def _get_venue_image_url_async(
 
 
 async def _get_venue_image_meta_async(
-    *, venue: str, city: str, country: str, source_url: str
+    *,
+    venue: str,
+    city: str,
+    country: str,
+    source_url: str,
+    exhibition_title: str = "",
 ) -> dict[str, str]:
     """
     Return image metadata for a venue image suitable for Excel export.
     Keys: image_url, page_url, license, license_url, credit, mode.
     """
     homepage = _venue_homepage_from_url(source_url) or ""
-    cache_key = _normalise_for_dedupe("|".join([venue, city, country, homepage or source_url]))
+    cache_key = _normalise_for_dedupe(
+        "|".join(
+            [
+                "exhibition",
+                exhibition_title or "",
+                source_url or "",
+                venue or "",
+                city or "",
+                country or "",
+            ]
+        )
+    )
     if cache_key and cache_key in _TEMP_IMAGE_LICENSE_CACHE:
         cached = _TEMP_IMAGE_LICENSE_CACHE.get(cache_key) or {}
         if cached.get("image_url"):
@@ -3402,6 +3504,37 @@ async def _get_venue_image_meta_async(
         if icon:
             img = icon
             page = source_url
+
+    # 2) If exhibition page has no valid image, search for this specific exhibition first.
+    if not img:
+        client = _get_openai_client()
+        if client is not None and (exhibition_title or source_url):
+            use_web_search_tool = "search-api" not in TEMP_SEARCH_MODEL.lower()
+            specific = await _find_exhibition_specific_image_meta_async(
+                client=client,
+                exhibition_title=exhibition_title or venue or city,
+                venue=venue,
+                city=city,
+                country=country,
+                source_url=source_url,
+                use_web_search_tool=use_web_search_tool,
+            )
+            if specific and specific.get("image_url"):
+                meta = await _enrich_image_rights_meta_async(
+                    meta=specific,
+                    venue=venue,
+                    city=city,
+                    country=country,
+                    source_url=source_url,
+                )
+                if not (meta.get("rights") or meta.get("license")):
+                    meta["rights"] = "Rights unknown"
+                if cache_key:
+                    _TEMP_IMAGE_LICENSE_CACHE[cache_key] = dict(meta)
+                    _TEMP_VENUE_IMAGE_CACHE[cache_key] = meta.get("image_url") or ""
+                return meta
+
+    # 3) Venue-level fallbacks (homepage/search) only after exhibition-specific attempts fail.
     if not img and homepage:
         html_home = await asyncio.to_thread(_fetch_url_text, homepage)
         img = _normalise_http_url(_extract_meta_image_url(html_home), base_url=homepage)
@@ -5082,9 +5215,17 @@ async def scrape_temporary_exhibitions_async(
         if not opening_hours:
             opening_hours = _VENUE_OPENING_INFO_FALLBACK
 
+        name_head = (name.split(":", 1)[0] if name else "").strip()
+        parsed_title, _parsed_rest = _split_exhibition_label(name_head)
+        exhibition_title_for_image = parsed_title or name_head
+
         # Best-effort venue image URL + legend (cached).
         image_meta = await _get_venue_image_meta_async(
-            venue=venue, city=ex_city, country=country, source_url=source_url
+            venue=venue,
+            city=ex_city,
+            country=country,
+            source_url=source_url,
+            exhibition_title=exhibition_title_for_image,
         )
         image_url = (image_meta.get("image_url") or "").strip()
         image_legend = _format_image_legend(image_meta)

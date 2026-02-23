@@ -513,6 +513,23 @@ def index() -> str:
 """
 
 
+@app.get("/healthz")
+@app.get("/api/healthz")
+def healthz() -> dict[str, Any]:
+    with _LOCK:
+        running_jobs = sum(1 for state in _RUNS.values() if state.status == "running")
+    return {
+        "ok": True,
+        "service": "divento-temp-scraper",
+        "status": "ready" if settings.OPENAI_API_KEY else "degraded",
+        "openai_configured": bool(settings.OPENAI_API_KEY),
+        "running_jobs": running_jobs,
+        "result_dir": str(Path(settings.RESULT_DIR).resolve()),
+        "log_dir": str(Path(settings.LOG_DIR).resolve()),
+        "time_utc": _utc_now_iso(),
+    }
+
+
 @app.post("/api/runs")
 def start_run(req: RunRequest) -> dict[str, Any]:
     cities = [c.strip() for c in (req.cities or []) if c.strip()]

@@ -12,3 +12,10 @@ __pycache__/
 data/*.xlsx
 data/*.numbers
 data/*_run_report.json
+
+# Local copies from droplet (not part of this repo)
+divento-scrapper/
+diventoscrapper/
+
+# Local runtime logs
+logs/
