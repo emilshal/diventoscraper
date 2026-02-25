@@ -176,6 +176,8 @@ class RunState:
     excel_path: str = ""
     report_path: str = ""
     city_results: list[dict[str, Any]] = field(default_factory=list)
+    progress: dict[str, Any] = field(default_factory=dict)
+    openai_metrics: dict[str, Any] = field(default_factory=dict)
 
 
 _RUNS: dict[str, RunState] = {}
@@ -202,9 +204,78 @@ def _write_report(state: RunState) -> None:
         "report_path": str(report_path),
         "cities_requested": state.cities_requested,
         "city_results": state.city_results,
+        "progress": state.progress,
+        "openai_metrics": state.openai_metrics,
     }
     report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     state.report_path = str(report_path)
+
+
+def _set_run_progress(state: RunState, **updates: Any) -> None:
+    current = dict(state.progress or {})
+    current.update(updates)
+    current["updated_at"] = _utc_now_iso()
+    state.progress = current
+
+
+def _new_openai_metrics() -> dict[str, Any]:
+    return {
+        "api_calls_total": 0,
+        "tokens_input_total": 0,
+        "tokens_output_total": 0,
+        "tokens_total": 0,
+        "tokens_cached_input_total": 0,
+        "tokens_reasoning_total": 0,
+        "api_calls_by_model": {},
+        "last_model": "",
+        "last_call_at": "",
+    }
+
+
+def _coerce_nonneg_int(value: Any) -> int:
+    try:
+        num = int(value or 0)
+    except Exception:
+        return 0
+    return num if num > 0 else 0
+
+
+def _record_openai_usage(state: RunState, event: dict[str, Any]) -> None:
+    metrics = state.openai_metrics if isinstance(state.openai_metrics, dict) else {}
+    if not metrics:
+        metrics = _new_openai_metrics()
+
+    calls_inc = _coerce_nonneg_int(event.get("api_calls", 1))
+    input_tokens = _coerce_nonneg_int(event.get("input_tokens"))
+    output_tokens = _coerce_nonneg_int(event.get("output_tokens"))
+    total_tokens = _coerce_nonneg_int(event.get("total_tokens"))
+    if total_tokens <= 0:
+        total_tokens = input_tokens + output_tokens
+    cached_input = _coerce_nonneg_int(event.get("cached_input_tokens"))
+    reasoning = _coerce_nonneg_int(event.get("reasoning_tokens"))
+    model = str(event.get("model") or "").strip()
+
+    metrics["api_calls_total"] = _coerce_nonneg_int(metrics.get("api_calls_total")) + calls_inc
+    metrics["tokens_input_total"] = _coerce_nonneg_int(metrics.get("tokens_input_total")) + input_tokens
+    metrics["tokens_output_total"] = _coerce_nonneg_int(metrics.get("tokens_output_total")) + output_tokens
+    metrics["tokens_total"] = _coerce_nonneg_int(metrics.get("tokens_total")) + total_tokens
+    metrics["tokens_cached_input_total"] = _coerce_nonneg_int(
+        metrics.get("tokens_cached_input_total")
+    ) + cached_input
+    metrics["tokens_reasoning_total"] = _coerce_nonneg_int(
+        metrics.get("tokens_reasoning_total")
+    ) + reasoning
+
+    if model:
+        by_model = metrics.get("api_calls_by_model")
+        if not isinstance(by_model, dict):
+            by_model = {}
+            metrics["api_calls_by_model"] = by_model
+        by_model[model] = _coerce_nonneg_int(by_model.get(model)) + calls_inc
+        metrics["last_model"] = model
+    metrics["last_call_at"] = _utc_now_iso()
+
+    state.openai_metrics = metrics
 
 
 def _parse_city_input(raw: str) -> dict[str, str]:
@@ -243,6 +314,23 @@ def _parse_city_input(raw: str) -> dict[str, str]:
 def _run_job(state: RunState) -> None:
     t0 = time.monotonic()
     try:
+        state.openai_metrics = _new_openai_metrics()
+
+        def _on_openai_usage(event: dict[str, Any]) -> None:
+            _record_openai_usage(state, event)
+
+        total_cities = len(state.cities_requested)
+        _set_run_progress(
+            state,
+            phase="starting",
+            total_cities=total_cities,
+            cities_completed=0,
+            current_city="",
+            current_city_index=0,
+            exhibitions_found_total=0,
+            elapsed_seconds=0.0,
+            eta_seconds=None,
+        )
         logger.info(
             "run_start run_id=%s cities=%s months=%s",
             state.run_id,
@@ -272,9 +360,21 @@ def _run_job(state: RunState) -> None:
         if total_max <= 0 or total_max > absolute_total:
             total_max = absolute_total
         remaining = total_max
+        exhibitions_found_total = 0
+        city_seconds_completed = 0.0
+        cities_completed = 0
 
-        for raw_city in state.cities_requested:
+        for city_idx, raw_city in enumerate(state.cities_requested, start=1):
             t_city = time.monotonic()
+            _set_run_progress(
+                state,
+                phase="processing_city",
+                current_city=raw_city,
+                current_city_index=city_idx,
+                cities_completed=cities_completed,
+                exhibitions_found_total=exhibitions_found_total,
+                elapsed_seconds=round(time.monotonic() - t0, 2),
+            )
             try:
                 status = ""
                 err = ""
@@ -290,15 +390,20 @@ def _run_job(state: RunState) -> None:
                         start_date=window_start,
                         end_date=window_end,
                         max_exhibitions=remaining,
+                        openai_usage_callback=_on_openai_usage,
                     )
                 else:
                     df = scrape_temporary_exhibitions(
-                        raw_city, months=state.months, max_exhibitions=remaining
+                        raw_city,
+                        months=state.months,
+                        max_exhibitions=remaining,
+                        openai_usage_callback=_on_openai_usage,
                     )
                 frames.append(df)
                 exhibitions = df.to_dict(orient="records")
                 if status != "skipped":
                     status = "ok" if exhibitions else "empty"
+                    exhibitions_found_total += int(len(exhibitions))
                     try:
                         remaining -= int(len(df.index))
                     except Exception:
@@ -318,13 +423,29 @@ def _run_job(state: RunState) -> None:
                     "exhibitions": exhibitions,
                 }
             )
+            city_elapsed = time.monotonic() - t_city
+            city_seconds_completed += city_elapsed
+            cities_completed += 1
+            remaining_cities = max(0, total_cities - cities_completed)
+            avg_city_seconds = (city_seconds_completed / cities_completed) if cities_completed else 0.0
+            eta_seconds = round(avg_city_seconds * remaining_cities, 2) if remaining_cities else 0.0
+            _set_run_progress(
+                state,
+                phase="processing_city" if remaining_cities else "writing_excel",
+                current_city="" if remaining_cities == 0 else raw_city,
+                current_city_index=city_idx,
+                cities_completed=cities_completed,
+                exhibitions_found_total=exhibitions_found_total,
+                elapsed_seconds=round(time.monotonic() - t0, 2),
+                eta_seconds=eta_seconds,
+            )
             logger.info(
                 "city_done run_id=%s city=%s status=%s exhibitions=%s seconds=%.2f",
                 state.run_id,
                 raw_city,
                 status,
                 len(exhibitions),
-                time.monotonic() - t_city,
+                city_elapsed,
             )
 
         state.city_results = city_results
@@ -339,22 +460,48 @@ def _run_job(state: RunState) -> None:
             cities=state.cities_requested, started_at_iso=state.started_at, run_id=state.run_id
         )
         state.excel_path = str(target)
+        _set_run_progress(
+            state,
+            phase="writing_excel",
+            elapsed_seconds=round(time.monotonic() - t0, 2),
+            cities_completed=cities_completed,
+            exhibitions_found_total=exhibitions_found_total,
+            eta_seconds=None,
+        )
         with pd.ExcelWriter(target, engine="openpyxl") as writer:
             _sanitize_df_for_excel(df_all).to_excel(writer, sheet_name="Exhibitions", index=False)
             _sanitize_df_for_excel(combinations).to_excel(writer, sheet_name="Combinations", index=False)
 
         state.status = "ok" if any(cr["status"] == "ok" for cr in city_results) else "empty"
         state.error = ""
+        _set_run_progress(
+            state,
+            phase="completed",
+            elapsed_seconds=round(time.monotonic() - t0, 2),
+            cities_completed=cities_completed,
+            current_city="",
+            eta_seconds=0.0,
+            exhibitions_found_total=exhibitions_found_total,
+        )
         logger.info(
-            "run_done run_id=%s status=%s seconds=%.2f excel=%s",
+            "run_done run_id=%s status=%s seconds=%.2f excel=%s openai_calls=%s tokens_total=%s",
             state.run_id,
             state.status,
             time.monotonic() - t0,
             state.excel_path,
+            int((state.openai_metrics or {}).get("api_calls_total") or 0),
+            int((state.openai_metrics or {}).get("tokens_total") or 0),
         )
     except Exception as exc:
         state.status = "error"
         state.error = repr(exc)
+        _set_run_progress(
+            state,
+            phase="error",
+            elapsed_seconds=round(time.monotonic() - t0, 2),
+            current_city="",
+            eta_seconds=None,
+        )
         logger.exception("run_error run_id=%s: %r", state.run_id, exc)
     finally:
         state.finished_at = _utc_now_iso()
@@ -604,6 +751,8 @@ def get_run(run_id: str) -> dict[str, Any]:
         "excel_path": state.excel_path,
         "report_path": state.report_path,
         "city_results": state.city_results,
+        "progress": state.progress,
+        "openai_metrics": state.openai_metrics,
     }
 
 

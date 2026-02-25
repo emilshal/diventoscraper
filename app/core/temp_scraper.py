@@ -1,10 +1,12 @@
 import asyncio
+import contextvars
 import random
 import re
 import uuid
 import json
 import logging
 import unicodedata
+from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -531,6 +533,9 @@ ua = UserAgent()
 logger = logging.getLogger(__name__)
 
 _OPENAI_CLIENTS: dict[str, AsyncOpenAI] = {}
+_OPENAI_USAGE_CALLBACK = contextvars.ContextVar(
+    "temp_openai_usage_callback", default=None
+)
 
 
 def _get_openai_client() -> AsyncOpenAI | None:
@@ -550,6 +555,62 @@ def _get_openai_client() -> AsyncOpenAI | None:
     new_client = AsyncOpenAI(api_key=key)
     _OPENAI_CLIENTS[fp] = new_client
     return new_client
+
+
+@contextmanager
+def temp_openai_usage_tracking(callback=None):
+    token = _OPENAI_USAGE_CALLBACK.set(callback)
+    try:
+        yield
+    finally:
+        _OPENAI_USAGE_CALLBACK.reset(token)
+
+
+def _usage_get(obj, key: str, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _usage_int(value) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def _emit_openai_usage_event(resp) -> None:
+    callback = _OPENAI_USAGE_CALLBACK.get()
+    if not callable(callback):
+        return
+
+    usage = getattr(resp, "usage", None)
+    input_tokens = _usage_int(_usage_get(usage, "input_tokens"))
+    output_tokens = _usage_int(_usage_get(usage, "output_tokens"))
+    total_tokens = _usage_int(_usage_get(usage, "total_tokens"))
+    if total_tokens <= 0:
+        total_tokens = input_tokens + output_tokens
+
+    input_details = _usage_get(usage, "input_tokens_details", None)
+    output_details = _usage_get(usage, "output_tokens_details", None)
+
+    event = {
+        "api_calls": 1,
+        "model": str(getattr(resp, "model", "") or ""),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "cached_input_tokens": _usage_int(
+            _usage_get(input_details, "cached_tokens", _usage_get(input_details, "cached_input_tokens"))
+        ),
+        "reasoning_tokens": _usage_int(_usage_get(output_details, "reasoning_tokens")),
+    }
+    try:
+        callback(event)
+    except Exception:
+        logger.debug("temp_openai_usage_callback_error", exc_info=True)
 
 
 # Model selection (temporary exhibitions only)
@@ -3865,7 +3926,9 @@ async def _call_with_backoff(awaitable_factory, *, max_attempts: int = 5):
     last_exc: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            return await awaitable_factory()
+            resp = await awaitable_factory()
+            _emit_openai_usage_event(resp)
+            return resp
         except Exception as exc:  # noqa: BLE001
             if _is_insufficient_quota_error(exc):
                 raise
@@ -4385,6 +4448,13 @@ async def _fetch_temporary_exhibitions_window_async(
         curated_venues = curated_venues[:curated_max_venues]
     curated_only_mode = curated_enabled and bool(curated_venues)
 
+    # Cost-control mode for non-curated cities:
+    # run a single broad search pass only (no repeated broad passes, no venue discovery/deepening).
+    if not curated_only_mode:
+        passes = 1
+        venue_deepen_passes = 0
+        venue_discovery_enabled = False
+
     curated_block = ""
     if curated_enabled and curated_venues:
         curated_block = (
@@ -4532,11 +4602,12 @@ async def _fetch_temporary_exhibitions_window_async(
                 return ""
 
         async def _run_search_with_retries(input_prompt: str) -> str:
-            content = await _run_search(input_prompt)
-            if not content or content.strip() in ("[]", ""):
+            max_tries = 3 if curated_only_mode else 1
+            content = ""
+            for _ in range(max_tries):
                 content = await _run_search(input_prompt)
-            if content.strip() in ("[]", ""):
-                content = await _run_search(input_prompt)
+                if content and content.strip() not in ("[]", ""):
+                    break
             return content
 
         combined: list[dict] = []
@@ -5112,19 +5183,21 @@ def scrape_temporary_exhibitions(
     end_date=None,
     languages: list[str] | None = None,
     max_exhibitions: int | None = None,
+    openai_usage_callback=None,
 ) -> pd.DataFrame:
     # `asyncio.run()` cannot be called from inside an existing event loop (e.g. notebooks).
     # This function is called from a FastAPI background thread in `app/ui.py`, so it is safe.
-    return asyncio.run(
-        scrape_temporary_exhibitions_async(
-            city,
-            months=months,
-            start_date=start_date,
-            end_date=end_date,
-            languages=languages,
-            max_exhibitions=max_exhibitions,
+    with temp_openai_usage_tracking(openai_usage_callback):
+        return asyncio.run(
+            scrape_temporary_exhibitions_async(
+                city,
+                months=months,
+                start_date=start_date,
+                end_date=end_date,
+                languages=languages,
+                max_exhibitions=max_exhibitions,
+            )
         )
-    )
 
 
 async def scrape_temporary_exhibitions_async(
