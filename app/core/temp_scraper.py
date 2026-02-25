@@ -1143,6 +1143,71 @@ def _fuzzy_dedupe_items_same_dates(items: list[dict]) -> list[dict]:
     return deduped
 
 
+def _dedupe_export_rows_same_dates_cross_venue(rows: list[dict], score_row_fn) -> list[dict]:
+    """
+    Final safety dedupe for export rows:
+    if rows share the exact same city+country+start/end dates and the titles look like the
+    same exhibition, keep only the best row even when venue strings differ.
+    """
+    if not rows:
+        return rows
+
+    grouped: dict[str, list[dict]] = {}
+    extras: list[dict] = []
+    for r in rows:
+        label = str(r.get("Name of site, City") or "").strip()
+        title, _remainder = _split_exhibition_label(label)
+        title = title or _strip_label_date_suffix(label)
+        city_key = _normalise_for_similarity(str(r.get("Real city") or r.get("City") or "").strip())
+        country_key = _normalise_for_similarity(str(r.get("Country") or "").strip())
+        start_iso, end_iso = _stable_date_pair_strings(
+            str(r.get("Start date (YYYY-MM-DD)") or "").strip(),
+            str(r.get("End date (YYYY-MM-DD)") or "").strip(),
+        )
+        if not (title and start_iso and end_iso):
+            extras.append(r)
+            continue
+        group_key = "|".join([country_key, city_key, start_iso, end_iso])
+        grouped.setdefault(group_key, []).append(r)
+
+    out: list[dict] = []
+    for group in grouped.values():
+        ordered = sorted(group, key=score_row_fn, reverse=True)
+        kept: list[dict] = []
+        for cand in ordered:
+            cand_label = str(cand.get("Name of site, City") or "").strip()
+            cand_title, _ = _split_exhibition_label(cand_label)
+            cand_title = cand_title or _strip_label_date_suffix(cand_label)
+
+            dup_idx = -1
+            for idx, existing in enumerate(kept):
+                ex_label = str(existing.get("Name of site, City") or "").strip()
+                ex_title, _ = _split_exhibition_label(ex_label)
+                ex_title = ex_title or _strip_label_date_suffix(ex_label)
+                if _titles_likely_same_exhibition(cand_title, ex_title):
+                    dup_idx = idx
+                    break
+
+            if dup_idx < 0:
+                kept.append(cand)
+                continue
+
+            a, b = kept[dup_idx], cand
+            best, other = (b, a) if score_row_fn(b) > score_row_fn(a) else (a, b)
+            merged = dict(best)
+            for k, v in other.items():
+                if k not in merged or merged.get(k) in ("", None):
+                    merged[k] = v
+            if len((other.get("Full address") or "")) > len((merged.get("Full address") or "")):
+                merged["Full address"] = other.get("Full address") or merged.get("Full address")
+            kept[dup_idx] = merged
+
+        out.extend(kept)
+
+    out.extend(extras)
+    return out
+
+
 def _score_exhibition_item(item: dict) -> int:
     score = 0
     if (item.get("source_url") or "").strip():
@@ -5685,6 +5750,18 @@ async def scrape_temporary_exhibitions_async(
                 "temp_export_fuzzy_deduped city=%s before=%s after=%s",
                 city,
                 before_fuzzy,
+                len(rows),
+            )
+
+        # Tertiary safety dedupe: exact same run dates across the same city/country can still
+        # leak duplicate rows when the venue label differs (e.g. partner venues for one show).
+        before_cross_venue_dates = len(rows)
+        rows = _dedupe_export_rows_same_dates_cross_venue(rows, _score_export_row)
+        if len(rows) != before_cross_venue_dates:
+            logger.info(
+                "temp_export_exact_date_deduped city=%s before=%s after=%s",
+                city,
+                before_cross_venue_dates,
                 len(rows),
             )
 
