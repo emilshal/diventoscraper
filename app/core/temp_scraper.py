@@ -4116,17 +4116,20 @@ async def _generate_temp_copy_async(
         "- No brochure-style language, clichés, or exaggerated adjectives.\n\n"
         "SHORT\n"
         "- Maximum 164 characters.\n"
-        "- Write one concise factual sentence that identifies the main subject of the exhibition.\n"
+        "- Write one concise factual sentence that explains what the exhibition is about and why it is worth visiting.\n"
         "- It must still read naturally and include a verb.\n"
         "- Must not repeat the exhibition name.\n"
         "- Must not repeat the phrasing or start of the long description.\n\n"
-        "- Do not write teaser copy; prioritise a compact subject summary instead.\n"
+        "- Include a sentence identifying the subject of the exhibition and a reason to visit.\n"
+        "- The reason to visit should refer to artworks, objects, discoveries, or themes presented.\n"
+        "- Do not write pure teaser copy; prioritise a compact subject-led summary with a concrete reason to go.\n"
         "- Keep it to roughly 20-25 words when possible, while always staying under 164 characters.\n"
         "- If the exhibition is about a person, include name, role, nationality if relevant, and birth-death dates when known. If living, use '(born YEAR)'.\n"
         "- If it is about an artistic movement, include the movement name and approximate period.\n"
         "- If it is about a historical period, include the timeframe.\n"
         "- If it is about a place or culture, briefly identify the location and historical context.\n"
         "- If several subjects appear, identify the primary one only.\n"
+        "- Acceptable opening patterns include: subject first, subject within the opening clause, movement anchored at the start, or subject after a short opening phrase.\n"
         "- Do not prioritise the lay out of the exhibition.\n"
         "- The short description MUST NOT focus on rooms, spaces, galleries, displays, labels, or layout structure.\n"
         "- Also avoid: exhibition organisation, interpretation panels, sequences such as first/next/final, or physical walkthrough descriptions.\n"
@@ -5433,7 +5436,7 @@ async def scrape_temporary_exhibitions_async(
             )
             short_desc = (
                 short_desc
-                or "A concise introduction to the exhibition subject, its context and the main figure, movement or historical theme behind it."
+                or "A concise subject-led summary of the exhibition, highlighting the main figure, movement or theme and why the works shown matter."
             )
             long_desc = long_desc or ""
 
