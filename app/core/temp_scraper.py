@@ -1731,6 +1731,12 @@ def _validate_temp_copy(
         violations.append(f"short exceeds 164 chars ({len(short_clean)})")
     elif short_clean.lower().startswith("explore "):
         violations.append("short starts with 'Explore' (vary the opening)")
+    else:
+        title_head = (title or "").split(":", 1)[0].strip()
+        title_norm = _normalise_for_match(title_head)
+        short_norm = _normalise_for_match(short_clean)
+        if title_norm and short_norm and title_norm in short_norm:
+            violations.append("short repeats the exhibition title")
 
     if not long_clean:
         violations.append("long is empty")
@@ -1743,8 +1749,8 @@ def _validate_temp_copy(
             r = int(rating)
         except Exception:
             r = 0
-        if r not in (1, 2, 3, 4):
-            violations.append("rating must be 1, 2, 3, or 4")
+        if r not in (1, 2, 3, 4, 5):
+            violations.append("rating must be 1, 2, 3, 4, or 5")
 
     if not long_clean.startswith("<p>") or "</p>" not in long_clean:
         violations.append("long must be HTML paragraphs wrapped in <p> tags")
@@ -4091,6 +4097,10 @@ async def _generate_temp_copy_async(
         "- Do not use formula openings such as: Across…, Through…, Inside…, At The venue…, In this show…\n"
         "- Use an informal, easy to read style.\n"
         "- Avoid concluding or summary-style final sentences.\n"
+        "- When a major historical figure is mentioned for the first time in the main body text, include dates immediately after the name in brackets using ASCII hyphens: Name (1840-1926) or Name (born 1929).\n"
+        "- Only include those dates on the first mention of that person.\n"
+        "- Do not add dates for curators, living gallery staff, or minor references unless they are historically significant.\n"
+        "- Use dates mainly for artists, architects, writers, collectors, rulers, and major historical figures.\n"
         "OPENING STRATEGY (CRITICAL FOR VARIATION)\n"
         "- Each exhibition description must open using a different narrative angle.\n"
         "- Anchor the opening on why the exhibition is worth a visit.\n"
@@ -4106,9 +4116,17 @@ async def _generate_temp_copy_async(
         "- No brochure-style language, clichés, or exaggerated adjectives.\n\n"
         "SHORT\n"
         "- Maximum 164 characters.\n"
-        "- Must include a verb.\n"
+        "- Write one concise factual sentence that identifies the main subject of the exhibition.\n"
+        "- It must still read naturally and include a verb.\n"
         "- Must not repeat the exhibition name.\n"
         "- Must not repeat the phrasing or start of the long description.\n\n"
+        "- Do not write teaser copy; prioritise a compact subject summary instead.\n"
+        "- Keep it to roughly 20-25 words when possible, while always staying under 164 characters.\n"
+        "- If the exhibition is about a person, include name, role, nationality if relevant, and birth-death dates when known. If living, use '(born YEAR)'.\n"
+        "- If it is about an artistic movement, include the movement name and approximate period.\n"
+        "- If it is about a historical period, include the timeframe.\n"
+        "- If it is about a place or culture, briefly identify the location and historical context.\n"
+        "- If several subjects appear, identify the primary one only.\n"
         "- Do not prioritise the lay out of the exhibition.\n"
         "- The short description MUST NOT focus on rooms, spaces, galleries, displays, labels, or layout structure.\n"
         "- Also avoid: exhibition organisation, interpretation panels, sequences such as first/next/final, or physical walkthrough descriptions.\n"
@@ -4116,11 +4134,26 @@ async def _generate_temp_copy_async(
         f"{avoid_short_clause}"
         "OUTPUT\n"
         "RATING\n"
-        "- Add a numeric rating for this exhibition (integer 1–4) using this scale:\n"
-        "  4 = must see\n"
-        "  3 = very solid if you care about the field\n"
-        "  2 = niche / depends on your interests\n"
-        "  1 = honestly skippable unless you’re nearby or researching\n"
+        "- Assign a Divento editorial rating based on the exhibition's likely value to a visitor.\n"
+        "- Judge independently from the available evidence. Do not copy or average ratings from other websites.\n"
+        "- Add a numeric rating for this exhibition (integer 1-5) using this exact scale:\n"
+        "  1 = Avoid\n"
+        "  2 = Negligible interest\n"
+        "  3 = Worth a look\n"
+        "  4 = Worth planning for\n"
+        "  5 = Worth a detour\n"
+        "- Calibration:\n"
+        "  3 = average competent exhibition\n"
+        "  4 = clearly above average\n"
+        "  5 = rare and exceptional\n"
+        "  If evidence is thin or neutral, default to 3 unless there is strong reason otherwise.\n"
+        "- Rating distribution guidance:\n"
+        "  Most exhibitions should be 3.\n"
+        "  4 should be limited to clearly above-average shows.\n"
+        "  5 should be very rare.\n"
+        "  2 should be occasional.\n"
+        "  1 should be rare but possible.\n"
+        "- Avoid rating inflation. Do not rate most exhibitions highly.\n"
         "\n"
         "OUTPUT\n"
         "- Return ONLY a JSON object with exactly the keys 'short', 'long', and 'rating'.\n"
@@ -4161,7 +4194,7 @@ async def _generate_temp_copy_async(
                                 "properties": {
                                     "short": {"type": "string"},
                                     "long": {"type": "string"},
-                                    "rating": {"type": "integer", "enum": [1, 2, 3, 4]},
+                                    "rating": {"type": "integer", "enum": [1, 2, 3, 4, 5]},
                                 },
                                 "required": ["short", "long", "rating"],
                             },
@@ -4222,7 +4255,7 @@ async def _generate_temp_copy_async(
             title, venue_for_copy, short, long_html, rating_val, address
         )
         if long_html and (not best or len(last_violations) < len(best_violations)):
-            best = {"short": short, "long": long_html, "rating": str(rating_val or "")}
+            best = {"short": short, "long": long_html, "rating": str(rating_val or 3)}
             best_violations = last_violations[:]
 
         if not last_violations:
@@ -5391,8 +5424,8 @@ async def scrape_temporary_exhibitions_async(
         short_desc = (copy.get("short") or "").strip()
         long_desc = _normalise_html_spacing(copy.get("long") or "")
         rating = str(copy.get("rating") or "").strip()
-        if rating not in ("1", "2", "3", "4"):
-            rating = "4"
+        if rating not in ("1", "2", "3", "4", "5"):
+            rating = "3"
         if not short_desc or not long_desc:
             print(
                 "DEBUG scrape_temporary_exhibitions copy generation failed:",
@@ -5400,7 +5433,7 @@ async def scrape_temporary_exhibitions_async(
             )
             short_desc = (
                 short_desc
-                or "See key works and objects that map the show’s themes and context."
+                or "A concise introduction to the exhibition subject, its context and the main figure, movement or historical theme behind it."
             )
             long_desc = long_desc or ""
 
