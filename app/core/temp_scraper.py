@@ -1208,6 +1208,45 @@ def _dedupe_export_rows_same_dates_cross_venue(rows: list[dict], score_row_fn) -
     return out
 
 
+def _dedupe_keep_first_same_venue_dates(items: list[dict]) -> list[dict]:
+    """
+    Order-preserving safety dedupe for non-curated search paths.
+    If multiple rows share the same city/country/canonical venue and exact start/end dates,
+    keep the first row and fill any missing fields from later rows.
+    """
+    if not items:
+        return items
+
+    seen: dict[str, int] = {}
+    out: list[dict] = []
+    for item in items:
+        venue_key = _canonical_venue_for_similarity(str(item.get("venue") or "").strip())
+        city_key = _normalise_for_similarity(str(item.get("city") or "").strip())
+        country_key = _normalise_for_similarity(str(item.get("country") or "").strip())
+        start_iso, end_iso = _stable_date_pair_strings(
+            str(item.get("start_date") or "").strip(),
+            str(item.get("end_date") or "").strip(),
+        )
+        if not (venue_key and start_iso and end_iso):
+            out.append(item)
+            continue
+
+        group_key = "|".join([country_key, city_key, venue_key, start_iso, end_iso])
+        existing_idx = seen.get(group_key)
+        if existing_idx is None:
+            seen[group_key] = len(out)
+            out.append(item)
+            continue
+
+        merged = dict(out[existing_idx])
+        for k, v in item.items():
+            if merged.get(k) in ("", None) and v not in ("", None):
+                merged[k] = v
+        out[existing_idx] = merged
+
+    return out
+
+
 def _score_exhibition_item(item: dict) -> int:
     score = 0
     if (item.get("source_url") or "").strip():
@@ -5213,6 +5252,17 @@ async def _fetch_temporary_exhibitions_window_async(
                     before_fuzzy,
                     len(filtered),
                 )
+
+            if not curated_only_mode:
+                before_same_dates = len(filtered)
+                filtered = _dedupe_keep_first_same_venue_dates(filtered)
+                if len(filtered) != before_same_dates:
+                    logger.info(
+                        "temp_search_non_curated_date_deduped city=%s before=%s after=%s",
+                        city,
+                        before_same_dates,
+                        len(filtered),
+                    )
 
         # Apply the hard cap early so we don't do hours/coords backfills for items we won't return.
         if desired_max > 0 and len(filtered) > desired_max:
