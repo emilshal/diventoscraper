@@ -4550,11 +4550,16 @@ async def _fetch_temporary_exhibitions_window_async(
     curated_only_mode = curated_enabled and bool(curated_venues)
 
     # Cost-control mode for non-curated cities:
-    # run a single broad search pass only (no repeated broad passes, no venue discovery/deepening).
+    # keep the broad search to a single pass, but still allow targeted fallback recovery
+    # (official-page retry + venue discovery/deepening) when results are empty or very thin.
     if not curated_only_mode:
         passes = 1
-        venue_deepen_passes = 0
-        venue_discovery_enabled = False
+        venue_deepen_passes = max(1, min(venue_deepen_passes, 1))
+        if venue_deepen_max_venues <= 0 or venue_deepen_max_venues > 12:
+            venue_deepen_max_venues = 12
+        venue_deepen_max_per_venue = max(1, min(venue_deepen_max_per_venue, 3))
+        if venue_discovery_max <= 0 or venue_discovery_max > 18:
+            venue_discovery_max = 18
 
     curated_block = ""
     if curated_enabled and curated_venues:
@@ -4605,6 +4610,11 @@ async def _fetch_temporary_exhibitions_window_async(
         "Venue strategy:\n"
         "- It is OK to return many exhibitions from the same venue if they are distinct and verifiable.\n"
         "- Do not artificially cap the number of exhibitions per venue.\n\n"
+        "Retrieval strategy:\n"
+        "- Primary goal is to identify real temporary exhibitions and their official source pages.\n"
+        "- It is better to return a real in-window exhibition with some ancillary fields empty than to return an empty array.\n"
+        "- Prioritise these fields first: name, venue, start_date, end_date, source_url.\n"
+        "- Supporting fields like address, coordinates, duration, opening pattern, and opening hours may be left empty when they are not quickly verifiable and can be backfilled later.\n\n"
         f"{venue_hint_block}"
         f"{curated_block}"
         f"{venue_discovery_block}"
@@ -4637,8 +4647,8 @@ async def _fetch_temporary_exhibitions_window_async(
         "4. Additional info\n"
         "- information: one or two sentences of additional factual context or practical "
         "information about the exhibition, without marketing language.\n"
-        "- latitude and longitude: REQUIRED. Provide decimal coordinates for the venue based on reliable sources; do not leave blank.\n"
-        "- If coordinates are not on the venue page, use a reliable map listing to verify them.\n\n"
+        "- latitude and longitude: provide decimal coordinates for the venue when they are reliably available.\n"
+        "- If coordinates are not quickly verifiable, return empty strings and they can be backfilled later.\n\n"
         "5. Opening pattern\n"
         "- repeat_pattern: 'daily' or 'weekly' based on how the exhibition runs.\n"
         "- open_days: comma-separated weekdays when open (e.g. Tue,Wed,Thu,Fri,Sat,Sun). If open daily, return Mon,Tue,Wed,Thu,Fri,Sat,Sun.\n"
@@ -4921,9 +4931,61 @@ async def _fetch_temporary_exhibitions_window_async(
                 if len(combined) >= pool_max:
                     break
 
-        if not combined:
-            logger.debug("temp_search_empty city=%s raw=%r", city, last_raw[:2000])
-            return []
+        if not combined and not curated_only_mode:
+            empty_retry_prompt = (
+                base_prompt
+                + "\n\nFallback step: the first broad search returned no usable exhibitions.\n"
+                + "- Search again by checking official museum/gallery 'what's on' and exhibition pages in this city.\n"
+                + "- Focus on real exhibitions first; ancillary fields may be empty if they are not quickly verifiable.\n"
+                + "- Do not return an empty array unless you cannot verify any qualifying exhibition after checking multiple likely venues.\n"
+            )
+            content = await _run_search(empty_retry_prompt)
+            last_raw = content or last_raw
+            if not content or content.strip() in ("[]", ""):
+                logger.warning(
+                    "temp_search_empty_retry city=%s parsed=%s new=%s total=%s kept_est=%s note=%s raw=%r",
+                    city,
+                    0,
+                    0,
+                    len(combined),
+                    _kept_estimate_count(combined),
+                    "empty",
+                    (last_raw or "")[:600],
+                )
+            else:
+                data = _extract_json_array(content)
+                if data is None:
+                    logger.warning(
+                        "temp_search_empty_retry city=%s parsed=%s new=%s total=%s kept_est=%s note=%s raw=%r",
+                        city,
+                        0,
+                        0,
+                        len(combined),
+                        _kept_estimate_count(combined),
+                        "parse_failed",
+                        (content or "")[:600],
+                    )
+                else:
+                    before_total = len(combined)
+                    for item in data:
+                        if not isinstance(item, dict):
+                            continue
+                        k = _dedupe_exhibition_key(item)
+                        if not k or k in seen:
+                            continue
+                        seen.add(k)
+                        combined.append(item)
+                        if len(combined) >= pool_max:
+                            break
+                    logger.info(
+                        "temp_search_empty_retry city=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
+                        city,
+                        len(data),
+                        max(0, len(combined) - before_total),
+                        len(combined),
+                        _kept_estimate_count(combined),
+                        "",
+                    )
 
         # Per-venue deepening: query specific venues to extract additional temporary exhibitions.
         if (
@@ -4931,9 +4993,16 @@ async def _fetch_temporary_exhibitions_window_async(
             and (
             venue_deepen_passes > 0
             and len(combined) < pool_max
-            and (int(target_max) > 0 and _kept_estimate_count(combined) < desired_max)
+            and _kept_estimate_count(combined) < desired_min
             )
         ):
+            logger.info(
+                "temp_search_non_curated_fallback city=%s kept_est=%s target_min=%s venue_discovery_enabled=%s",
+                city,
+                _kept_estimate_count(combined),
+                desired_min,
+                venue_discovery_enabled,
+            )
             if (
                 venue_discovery_enabled
                 and venue_discovery_max > 0
@@ -5048,6 +5117,10 @@ async def _fetch_temporary_exhibitions_window_async(
                         _kept_estimate_count(combined),
                         "",
                     )
+
+        if not combined:
+            logger.warning("temp_search_empty city=%s raw=%r", city, last_raw[:2000])
+            return []
 
         logger.debug("temp_search_combined city=%s items=%s", city, len(combined))
 
