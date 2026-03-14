@@ -1212,8 +1212,10 @@ def _dedupe_export_rows_same_dates_cross_venue(rows: list[dict], score_row_fn) -
 def _dedupe_keep_first_same_venue_dates(items: list[dict]) -> list[dict]:
     """
     Order-preserving safety dedupe for non-curated search paths.
-    If multiple rows share the same city/country/canonical venue and exact start/end dates,
+    If multiple rows share the same city/country and exact start/end dates,
     keep the first row and fill any missing fields from later rows.
+
+    This is intentionally aggressive for non-curated paths: title and venue are ignored.
     """
     if not items:
         return items
@@ -1221,18 +1223,17 @@ def _dedupe_keep_first_same_venue_dates(items: list[dict]) -> list[dict]:
     seen: dict[str, int] = {}
     out: list[dict] = []
     for item in items:
-        venue_key = _canonical_venue_for_similarity(str(item.get("venue") or "").strip())
         city_key = _normalise_for_similarity(str(item.get("city") or "").strip())
         country_key = _normalise_for_similarity(str(item.get("country") or "").strip())
         start_iso, end_iso = _stable_date_pair_strings(
             str(item.get("start_date") or "").strip(),
             str(item.get("end_date") or "").strip(),
         )
-        if not (venue_key and start_iso and end_iso):
+        if not (city_key and country_key and start_iso and end_iso):
             out.append(item)
             continue
 
-        group_key = "|".join([country_key, city_key, venue_key, start_iso, end_iso])
+        group_key = "|".join([country_key, city_key, start_iso, end_iso])
         existing_idx = seen.get(group_key)
         if existing_idx is None:
             seen[group_key] = len(out)
@@ -1848,9 +1849,7 @@ def _validate_temp_copy(
         violations.append("long is empty")
         return violations
 
-    if rating is None:
-        violations.append("rating is missing")
-    else:
+    if rating is not None:
         try:
             r = int(rating)
         except Exception:
@@ -4242,30 +4241,7 @@ async def _generate_temp_copy_async(
         "- Do not start the short description with 'Explore'.\n"
         f"{avoid_short_clause}"
         "OUTPUT\n"
-        "RATING\n"
-        "- Assign a Divento editorial rating based on the exhibition's likely value to a visitor.\n"
-        "- Judge independently from the available evidence. Do not copy or average ratings from other websites.\n"
-        "- Add a numeric rating for this exhibition (integer 1-5) using this exact scale:\n"
-        "  1 = Avoid\n"
-        "  2 = Negligible interest\n"
-        "  3 = Worth a look\n"
-        "  4 = Worth planning for\n"
-        "  5 = Worth a detour\n"
-        "- Calibration:\n"
-        "  3 = average competent exhibition\n"
-        "  4 = clearly above average\n"
-        "  5 = rare and exceptional\n"
-        "  If evidence is thin or neutral, default to 3 unless there is strong reason otherwise.\n"
-        "- Rating distribution guidance:\n"
-        "  Most exhibitions should be 3.\n"
-        "  4 should be limited to clearly above-average shows.\n"
-        "  5 should be very rare.\n"
-        "  2 should be occasional.\n"
-        "  1 should be rare but possible.\n"
-        "- Avoid rating inflation. Do not rate most exhibitions highly.\n"
-        "\n"
-        "OUTPUT\n"
-        "- Return ONLY a JSON object with exactly the keys 'short', 'long', and 'rating'.\n"
+        "- Return ONLY a JSON object with exactly the keys 'short' and 'long'.\n"
         "- Both 'short' and 'long' must be non-empty strings.\n"
     )
 
@@ -4303,9 +4279,8 @@ async def _generate_temp_copy_async(
                                 "properties": {
                                     "short": {"type": "string"},
                                     "long": {"type": "string"},
-                                    "rating": {"type": "integer", "enum": [1, 2, 3, 4, 5]},
                                 },
-                                "required": ["short", "long", "rating"],
+                                "required": ["short", "long"],
                             },
                         },
                     },
@@ -4347,28 +4322,22 @@ async def _generate_temp_copy_async(
 
         short = str(data.get("short") or "").strip()
         long_html = str(data.get("long") or "").strip()
-        rating_raw = data.get("rating")
-        rating_val: int | None
-        try:
-            rating_val = int(rating_raw) if rating_raw is not None else None
-        except Exception:
-            rating_val = None
         try:
             last_json = json.dumps(
-                {"short": short, "long": long_html, "rating": rating_val}, ensure_ascii=False
+                {"short": short, "long": long_html}, ensure_ascii=False
             )
         except Exception:
             last_json = content[:2000]
 
         last_violations = _validate_temp_copy(
-            title, venue_for_copy, short, long_html, rating_val, address
+            title, venue_for_copy, short, long_html, None, address
         )
         if long_html and (not best or len(last_violations) < len(best_violations)):
-            best = {"short": short, "long": long_html, "rating": str(rating_val or 3)}
+            best = {"short": short, "long": long_html}
             best_violations = last_violations[:]
 
         if not last_violations:
-            return {"short": short, "long": long_html, "rating": str(rating_val)}
+            return {"short": short, "long": long_html}
 
     if best:
         if best_violations:
@@ -4378,6 +4347,183 @@ async def _generate_temp_copy_async(
             )
         return best
     return {"short": "", "long": ""}
+
+
+def _editorial_rating_caps(batch_size: int) -> tuple[int, int]:
+    if batch_size <= 0:
+        return 0, 0
+    max_fives = 0 if batch_size < 8 else (1 if batch_size < 25 else max(1, (batch_size + 19) // 20))
+    max_fours = 1 if batch_size < 6 else max(2, (batch_size + 4) // 5)
+    max_fours = min(max_fours, max(0, batch_size - max_fives))
+    return max_fives, max_fours
+
+
+async def _assign_city_editorial_ratings_async(rows: list[dict], *, city: str) -> list[str]:
+    if not rows:
+        return []
+
+    client = _get_openai_client()
+    if client is None:
+        return ["3"] * len(rows)
+
+    max_fives, max_fours = _editorial_rating_caps(len(rows))
+    evidence_rows: list[dict] = []
+    for idx, row in enumerate(rows):
+        label = str(row.get("Name of site, City") or "").strip()
+        title, remainder = _split_exhibition_label(label)
+        title = title or _strip_label_date_suffix(label)
+        venue = _strip_label_date_suffix(remainder)
+        long_excerpt = re.sub(r"\s+", " ", _strip_html(str(row.get("Long description") or ""))).strip()
+        if len(long_excerpt) > 240:
+            long_excerpt = long_excerpt[:237].rsplit(" ", 1)[0].strip() + "..."
+        evidence_rows.append(
+            {
+                "id": idx,
+                "title": title,
+                "venue": venue,
+                "short": str(row.get("Short description") or "").strip(),
+                "information": str(row.get("Information") or "").strip(),
+                "long_excerpt": long_excerpt,
+            }
+        )
+
+    prompt = (
+        f"Assign Divento editorial ratings for a batch of temporary exhibitions in {city}.\n\n"
+        "Use this exact scale:\n"
+        "1 = Avoid\n"
+        "2 = Negligible interest\n"
+        "3 = Worth a look\n"
+        "4 = Worth planning for\n"
+        "5 = Worth a detour\n\n"
+        "Judge independently from the available evidence. Do not copy or average ratings from other websites.\n"
+        "Calibration:\n"
+        "- 3 = average competent exhibition\n"
+        "- 4 = clearly above average\n"
+        "- 5 = rare and exceptional\n"
+        "- If evidence is thin or neutral, default to 3 unless there is strong reason otherwise.\n\n"
+        "Distribution guidance:\n"
+        "- Most exhibitions should be 3.\n"
+        f"- Keep rating 4 limited to about {max_fours} exhibitions in this batch.\n"
+        f"- Keep rating 5 very rare, at most about {max_fives} exhibitions in this batch.\n"
+        "- Use rating 2 for occasional minor or weak exhibitions.\n"
+        "- Use rating 1 only for rare clearly poor exhibitions.\n"
+        "- Avoid rating inflation.\n\n"
+        "Return a JSON array sorted from strongest exhibition to weakest exhibition.\n"
+        "Each object must have exactly these keys: 'id' and 'rating'.\n"
+        "Include every id exactly once.\n\n"
+        "EXHIBITIONS JSON\n"
+        f"{json.dumps(evidence_rows, ensure_ascii=False)}"
+    )
+
+    content = ""
+    try:
+        resp = await _call_with_backoff(
+            lambda: client.responses.create(
+                model=TEMP_COPY_MODEL,
+                input=prompt,
+                reasoning={"effort": "medium"},
+                text={
+                    "verbosity": "low",
+                    "format": {
+                        "type": "json_schema",
+                        "name": "temp_city_editorial_ratings",
+                        "strict": True,
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "id": {"type": "integer"},
+                                    "rating": {"type": "integer", "enum": [1, 2, 3, 4, 5]},
+                                },
+                                "required": ["id", "rating"],
+                            },
+                        },
+                    },
+                },
+                max_output_tokens=max(900, min(4000, 100 + len(rows) * 30)),
+            )
+        )
+        content = _clean_json_content(resp.output_text or _extract_response_text(resp) or "")
+    except Exception as exc_schema:  # noqa: BLE001
+        logger.debug("temp_city_rating_schema_error city=%s err=%r", city, exc_schema)
+        try:
+            resp = await _call_with_backoff(
+                lambda: client.responses.create(
+                    model=TEMP_COPY_MODEL,
+                    input=prompt,
+                    reasoning={"effort": "medium"},
+                    text={"verbosity": "low", "format": {"type": "json_object"}},
+                    max_output_tokens=max(900, min(4000, 100 + len(rows) * 30)),
+                )
+            )
+            content = _clean_json_content(resp.output_text or _extract_response_text(resp) or "")
+        except Exception as exc_obj:  # noqa: BLE001
+            logger.debug("temp_city_rating_object_error city=%s err=%r", city, exc_obj)
+            return ["3"] * len(rows)
+
+    data = _extract_json_array(content) if content else None
+    if not isinstance(data, list):
+        logger.info("temp_city_rating_invalid_json city=%s", city)
+        return ["3"] * len(rows)
+
+    rating_by_id: dict[int, int] = {}
+    ordered_ids: list[int] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("id"))
+            rating = int(item.get("rating"))
+        except Exception:
+            continue
+        if idx < 0 or idx >= len(rows) or rating not in (1, 2, 3, 4, 5) or idx in rating_by_id:
+            continue
+        rating_by_id[idx] = rating
+        ordered_ids.append(idx)
+
+    for idx in range(len(rows)):
+        if idx not in rating_by_id:
+            rating_by_id[idx] = 3
+            ordered_ids.append(idx)
+
+    final_ratings = ["3"] * len(rows)
+    used_fives = 0
+    used_fours = 0
+    for idx in ordered_ids:
+        rating = rating_by_id.get(idx, 3)
+        if rating == 5:
+            if used_fives < max_fives:
+                final_ratings[idx] = "5"
+                used_fives += 1
+            elif used_fours < max_fours:
+                final_ratings[idx] = "4"
+                used_fours += 1
+            else:
+                final_ratings[idx] = "3"
+        elif rating == 4:
+            if used_fours < max_fours:
+                final_ratings[idx] = "4"
+                used_fours += 1
+            else:
+                final_ratings[idx] = "3"
+        elif rating in (1, 2, 3):
+            final_ratings[idx] = str(rating)
+        else:
+            final_ratings[idx] = "3"
+
+    logger.info(
+        "temp_city_ratings city=%s count=%s dist_1=%s dist_2=%s dist_3=%s dist_4=%s dist_5=%s",
+        city,
+        len(final_ratings),
+        final_ratings.count("1"),
+        final_ratings.count("2"),
+        final_ratings.count("3"),
+        final_ratings.count("4"),
+        final_ratings.count("5"),
+    )
+    return final_ratings
 
 
 def _zh_latin_leaks(text: str) -> list[str]:
@@ -5666,9 +5812,6 @@ async def scrape_temporary_exhibitions_async(
 
         short_desc = (copy.get("short") or "").strip()
         long_desc = _normalise_html_spacing(copy.get("long") or "")
-        rating = str(copy.get("rating") or "").strip()
-        if rating not in ("1", "2", "3", "4", "5"):
-            rating = "3"
         if not short_desc or not long_desc:
             print(
                 "DEBUG scrape_temporary_exhibitions copy generation failed:",
@@ -5804,7 +5947,7 @@ async def scrape_temporary_exhibitions_async(
             "Ticket URL": ticket_url,
             "Longitude": longitude,
             "Activity type": "",
-            "Rating": rating,
+            "Rating": "3",
             "Name of site city": title,
             "Name of site city fr": "",
             "Name of site city es": "",
@@ -6040,6 +6183,11 @@ async def scrape_temporary_exhibitions_async(
                 before_cross_venue_dates,
                 len(rows),
             )
+
+        calibrated_ratings = await _assign_city_editorial_ratings_async(rows, city=city)
+        for idx, rating in enumerate(calibrated_ratings):
+            if idx < len(rows):
+                rows[idx]["Rating"] = rating
 
     df = pd.DataFrame(rows)
     for title_col in (
