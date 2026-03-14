@@ -31,6 +31,7 @@ LANGUAGES = ["fr", "es", "it", "ru", "zh-CN"]
 
 _TEMP_VENUE_IMAGE_CACHE: dict[str, str] = {}
 _TEMP_VENUE_COORD_CACHE: dict[str, tuple[str, str, str]] = {}
+_TEMP_VENUE_ADDRESS_CACHE: dict[str, dict[str, str]] = {}
 _TEMP_VENUE_DISCOVERY_CACHE: dict[str, list[dict[str, str]]] = {}
 _TEMP_VENUE_HOURS_CACHE: dict[str, dict[str, str]] = {}
 _TEMP_IMAGE_LICENSE_CACHE: dict[str, dict[str, str]] = {}
@@ -1355,6 +1356,72 @@ async def _lookup_venue_coords_async(
     except Exception as exc:  # noqa: BLE001
         logger.debug(
             "temp_venue_coord_lookup_error venue=%s city=%s country=%s err=%r",
+            venue,
+            city,
+            country,
+            exc,
+        )
+        return None
+
+
+async def _lookup_venue_address_async(
+    *,
+    client: AsyncOpenAI,
+    venue: str,
+    city: str,
+    country: str,
+    source_url: str,
+    use_web_search_tool: bool,
+) -> dict[str, str] | None:
+    """
+    Best-effort venue address lookup.
+    Returns: {address, source_url}
+    """
+    raw_key = "|".join([venue or "", city or "", country or "", source_url or ""])
+    key = _normalise_for_dedupe(raw_key)
+    if key and key in _TEMP_VENUE_ADDRESS_CACHE:
+        return _TEMP_VENUE_ADDRESS_CACHE.get(key)
+
+    tools = [{"type": "web_search"}] if use_web_search_tool else None
+    prompt = (
+        "Find the full postal address for this museum/gallery venue.\n"
+        "Return ONLY JSON with keys: address, source_url.\n"
+        "Rules:\n"
+        "- Prefer the official venue website contact/visit page.\n"
+        "- If not available, use a reliable map or institutional listing.\n"
+        "- address should be the fullest postal address you can verify.\n"
+        "- If you cannot verify a full postal address, return the best venue location string you can verify for publication.\n"
+        "- If nothing reliable is found, return empty strings.\n\n"
+        f"Venue: {venue}\n"
+        f"City: {city}\n"
+        f"Country: {country}\n"
+        f"Known source_url (may help): {source_url}\n"
+    )
+    try:
+        resp = await _call_with_backoff(
+            lambda: client.responses.create(
+                model=TEMP_SEARCH_MODEL,
+                input=prompt,
+                tools=tools,
+                max_output_tokens=700,
+            ),
+            max_attempts=3,
+        )
+        content = _clean_json_content(resp.output_text or _extract_response_text(resp) or "")
+        data = _extract_json_object(content) if content else None
+        if not isinstance(data, dict):
+            return None
+        address = str(data.get("address") or "").strip()
+        src = str(data.get("source_url") or "").strip()
+        if not address:
+            return None
+        out = {"address": address, "source_url": src}
+        if key:
+            _TEMP_VENUE_ADDRESS_CACHE[key] = out
+        return out
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "temp_venue_address_lookup_error venue=%s city=%s country=%s err=%r",
             venue,
             city,
             country,
@@ -5267,6 +5334,56 @@ async def _fetch_temporary_exhibitions_window_async(
         # Apply the hard cap early so we don't do hours/coords backfills for items we won't return.
         if desired_max > 0 and len(filtered) > desired_max:
             filtered = filtered[:desired_max]
+
+        # Fill missing venue addresses (best-effort) for the kept set only.
+        missing_address = [
+            it
+            for it in filtered
+            if not str(it.get("address") or "").strip()
+        ]
+        if missing_address:
+            before_missing_address = sum(
+                1 for it in filtered if not str(it.get("address") or "").strip()
+            )
+            sem = asyncio.Semaphore(geo_conc)
+
+            async def _fill_address_one(it: dict) -> None:
+                async with sem:
+                    looked = await _lookup_venue_address_async(
+                        client=client,
+                        venue=(it.get("venue") or "").strip(),
+                        city=(it.get("city") or city).strip(),
+                        country=(it.get("country") or "").strip(),
+                        source_url=(it.get("source_url") or "").strip(),
+                        use_web_search_tool=use_web_search_tool,
+                    )
+                    found_address = str((looked or {}).get("address") or "").strip()
+                    if found_address:
+                        it["address"] = _abbrev_country_in_address(
+                            found_address,
+                            str(it.get("country") or "").strip(),
+                        )
+
+            await asyncio.gather(*[_fill_address_one(it) for it in missing_address])
+
+            for it in filtered:
+                if str(it.get("address") or "").strip():
+                    continue
+                venue = str(it.get("venue") or "").strip()
+                item_city = str(it.get("city") or city).strip()
+                item_country = str(it.get("country") or "").strip()
+                fallback_parts = [p for p in [venue, item_city, item_country] if p]
+                if fallback_parts:
+                    it["address"] = ", ".join(fallback_parts)
+            after_missing_address = sum(
+                1 for it in filtered if not str(it.get("address") or "").strip()
+            )
+            logger.info(
+                "temp_search_address_backfill city=%s before_missing=%s after_missing=%s",
+                city,
+                before_missing_address,
+                after_missing_address,
+            )
 
         # Fill missing venue coordinates (best-effort) for the kept set only.
         missing = [
