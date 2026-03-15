@@ -4745,7 +4745,7 @@ async def _fetch_temporary_exhibitions_window_async(
 ) -> list[dict]:
     client = _get_openai_client()
     if client is None:
-        return []
+        raise RuntimeError("OpenAI client unavailable for temporary exhibition search")
 
     hard_max = max(1, int(getattr(settings, "TEMP_HARD_MAX_EXHIBITIONS", 200) or 200))
     absolute_max_setting = int(getattr(settings, "TEMP_ABSOLUTE_MAX_EXHIBITIONS", 10) or 0)
@@ -4947,7 +4947,11 @@ async def _fetch_temporary_exhibitions_window_async(
                 n += 1
             return n
 
-        async def _run_search(input_prompt: str) -> str:
+        had_search_failures = False
+        had_successful_search_response = False
+        last_search_error = ""
+
+        async def _run_search(input_prompt: str, *, stage: str) -> tuple[str, str]:
             try:
                 resp = await _call_with_backoff(
                     lambda: client.responses.create(
@@ -4957,21 +4961,65 @@ async def _fetch_temporary_exhibitions_window_async(
                         max_output_tokens=12000,
                     )
                 )
-                return _clean_json_content(
-                    resp.output_text or _extract_response_text(resp) or ""
+                return (
+                    _clean_json_content(
+                        resp.output_text or _extract_response_text(resp) or ""
+                    ),
+                    "",
                 )
             except Exception as exc_resp:  # noqa: BLE001
-                logger.debug("temp_search_responses_error city=%s err=%r", city, exc_resp)
-                return ""
+                nonlocal had_search_failures, last_search_error
+                had_search_failures = True
+                last_search_error = repr(exc_resp)
+                logger.warning(
+                    "temp_search_request_error city=%s stage=%s err=%r",
+                    city,
+                    stage,
+                    exc_resp,
+                )
+                return "", repr(exc_resp)
 
-        async def _run_search_with_retries(input_prompt: str) -> str:
-            max_tries = 3 if curated_only_mode else 1
-            content = ""
-            for _ in range(max_tries):
-                content = await _run_search(input_prompt)
-                if content and content.strip() not in ("[]", ""):
-                    break
-            return content
+        async def _run_search_with_retries(
+            input_prompt: str,
+            *,
+            stage: str,
+            max_tries: int | None = None,
+        ) -> tuple[str, str, str]:
+            nonlocal had_search_failures, had_successful_search_response, last_search_error
+            tries = max_tries if max_tries is not None else (4 if curated_only_mode else 5)
+            last_content = ""
+            saw_valid_empty = False
+            for attempt in range(1, max(1, tries) + 1):
+                content, err = await _run_search(input_prompt, stage=f"{stage}:attempt_{attempt}")
+                stripped = (content or "").strip()
+                if not stripped:
+                    if attempt < tries:
+                        await _sleep_with_jitter(min(4.0, 0.4 * (2 ** (attempt - 1))))
+                    continue
+                last_content = content
+                data = _extract_json_array(content)
+                if data is None:
+                    had_search_failures = True
+                    last_search_error = f"JSON parse failed for {stage}"
+                    logger.warning(
+                        "temp_search_parse_retry city=%s stage=%s attempt=%s raw=%r",
+                        city,
+                        stage,
+                        attempt,
+                        (content or "")[:600],
+                    )
+                    if attempt < tries:
+                        await _sleep_with_jitter(min(4.0, 0.4 * (2 ** (attempt - 1))))
+                    continue
+                had_successful_search_response = True
+                if isinstance(data, list) and data:
+                    return content, "ok", ""
+                saw_valid_empty = True
+                if attempt < tries:
+                    await _sleep_with_jitter(min(3.0, 0.3 * (2 ** (attempt - 1))))
+            if saw_valid_empty:
+                return last_content, "empty", ""
+            return last_content, "failed", last_search_error
 
         combined: list[dict] = []
         seen: set[str] = set()
@@ -5027,8 +5075,12 @@ async def _fetch_temporary_exhibitions_window_async(
                     + "\n- ".join(existing_for_venue or ["(none)"])
                     + "\n\nReturn ONLY a raw JSON array.\n"
                 )
-                content = await _run_search_with_retries(curated_prompt)
-                if not content or content.strip() in ("[]", ""):
+                content, run_status, run_err = await _run_search_with_retries(
+                    curated_prompt,
+                    stage=f"curated:{venue_name}",
+                    max_tries=4,
+                )
+                if run_status != "ok":
                     logger.info(
                         "temp_search_curated city=%s venue=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
                         city,
@@ -5037,7 +5089,7 @@ async def _fetch_temporary_exhibitions_window_async(
                         0,
                         len(combined),
                         _kept_estimate_count(combined),
-                        "empty",
+                        run_status if not run_err else f"{run_status}:{run_err[:120]}",
                     )
                     continue
                 data = _extract_json_array(content)
@@ -5105,83 +5157,86 @@ async def _fetch_temporary_exhibitions_window_async(
                         + "\n"
                     )
 
-                content = await _run_search_with_retries(input_prompt)
-                last_raw = content or ""
-                logger.debug(
-                    "temp_search_raw city=%s pass=%s chars=%s snippet=%r",
-                    city,
-                    pass_idx + 1,
-                    len(content or ""),
-                    (content or "")[:1200],
-                )
-                if not content or content.strip() in ("[]", ""):
-                    logger.info(
-                        "temp_search_pass city=%s pass=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
-                        city,
-                        pass_idx + 1,
-                        0,
-                        0,
-                        len(combined),
-                        _kept_estimate_count(combined),
-                        "empty",
+                    content, run_status, run_err = await _run_search_with_retries(
+                        input_prompt,
+                        stage=f"base_pass_{pass_idx + 1}",
                     )
-                    continue
-
-                data = _extract_json_array(content)
-                if data is None:
+                    last_raw = content or ""
                     logger.debug(
-                        "temp_search_parse_failed city=%s pass=%s raw=%r",
+                        "temp_search_raw city=%s pass=%s chars=%s snippet=%r",
                         city,
                         pass_idx + 1,
-                        (content or "")[:2000],
+                        len(content or ""),
+                        (content or "")[:1200],
                     )
+                    if run_status != "ok":
+                        logger.info(
+                            "temp_search_pass city=%s pass=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
+                            city,
+                            pass_idx + 1,
+                            0,
+                            0,
+                            len(combined),
+                            _kept_estimate_count(combined),
+                            run_status if not run_err else f"{run_status}:{run_err[:120]}",
+                        )
+                        continue
+
+                    data = _extract_json_array(content)
+                    if data is None:
+                        logger.debug(
+                            "temp_search_parse_failed city=%s pass=%s raw=%r",
+                            city,
+                            pass_idx + 1,
+                            (content or "")[:2000],
+                        )
+                        logger.info(
+                            "temp_search_pass city=%s pass=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
+                            city,
+                            pass_idx + 1,
+                            0,
+                            0,
+                            len(combined),
+                            _kept_estimate_count(combined),
+                            "parse_failed",
+                        )
+                        continue
+
+                    logger.debug(
+                        "temp_search_parsed city=%s pass=%s items=%s",
+                        city,
+                        pass_idx + 1,
+                        len(data),
+                    )
+                    for item in data:
+                        if not isinstance(item, dict):
+                            continue
+                        k = _dedupe_exhibition_key(item)
+                        if not k or k in seen:
+                            continue
+                        seen.add(k)
+                        combined.append(item)
+                        if len(combined) >= pool_max:
+                            break
+
+                    kept_est = _kept_estimate_count(combined)
+                    after_total = len(combined)
+                    new_added = max(0, after_total - before_total)
                     logger.info(
                         "temp_search_pass city=%s pass=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
                         city,
                         pass_idx + 1,
-                        0,
-                        0,
-                        len(combined),
-                        _kept_estimate_count(combined),
-                        "parse_failed",
+                        len(data),
+                        new_added,
+                        after_total,
+                        kept_est,
+                        f"kept_before={before_kept}",
                     )
-                    continue
-
-                logger.debug(
-                    "temp_search_parsed city=%s pass=%s items=%s",
-                    city,
-                    pass_idx + 1,
-                    len(data),
-                )
-                for item in data:
-                    if not isinstance(item, dict):
-                        continue
-                    k = _dedupe_exhibition_key(item)
-                    if not k or k in seen:
-                        continue
-                    seen.add(k)
-                    combined.append(item)
+                    # If we're uncapped, always run all base passes and just respect the safety pool limit.
+                    if int(target_max) > 0 and kept_est >= desired_max:
+                        break
                     if len(combined) >= pool_max:
                         break
-
-                kept_est = _kept_estimate_count(combined)
-                after_total = len(combined)
-                new_added = max(0, after_total - before_total)
-                logger.info(
-                    "temp_search_pass city=%s pass=%s parsed=%s new=%s total=%s kept_est=%s note=%s",
-                    city,
-                    pass_idx + 1,
-                    len(data),
-                    new_added,
-                    after_total,
-                    kept_est,
-                    f"kept_before={before_kept}",
-                )
-                # If we're uncapped, always run all base passes and just respect the safety pool limit.
-                if int(target_max) > 0 and kept_est >= desired_max:
-                    break
-                if len(combined) >= pool_max:
-                    break
 
         if not combined and not curated_only_mode:
             empty_retry_prompt = (
@@ -5191,9 +5246,13 @@ async def _fetch_temporary_exhibitions_window_async(
                 + "- Focus on real exhibitions first; ancillary fields may be empty if they are not quickly verifiable.\n"
                 + "- Do not return an empty array unless you cannot verify any qualifying exhibition after checking multiple likely venues.\n"
             )
-            content = await _run_search(empty_retry_prompt)
+            content, run_status, run_err = await _run_search_with_retries(
+                empty_retry_prompt,
+                stage="empty_retry",
+                max_tries=5,
+            )
             last_raw = content or last_raw
-            if not content or content.strip() in ("[]", ""):
+            if run_status != "ok":
                 logger.warning(
                     "temp_search_empty_retry city=%s parsed=%s new=%s total=%s kept_est=%s note=%s raw=%r",
                     city,
@@ -5201,7 +5260,7 @@ async def _fetch_temporary_exhibitions_window_async(
                     0,
                     len(combined),
                     _kept_estimate_count(combined),
-                    "empty",
+                    run_status if not run_err else f"{run_status}:{run_err[:120]}",
                     (last_raw or "")[:600],
                 )
             else:
@@ -5315,7 +5374,11 @@ async def _fetch_temporary_exhibitions_window_async(
                         + "\n- ".join(existing_for_venue or ["(none)"])
                         + "\n\nReturn ONLY a raw JSON array.\n"
                     )
-                    content = await _run_search_with_retries(deepen_prompt)
+                    content, run_status, run_err = await _run_search_with_retries(
+                        deepen_prompt,
+                        stage=f"deepen:{venue_name}",
+                        max_tries=4,
+                    )
                     logger.debug(
                         "temp_search_venue_raw city=%s venue=%s chars=%s snippet=%r",
                         city,
@@ -5323,7 +5386,7 @@ async def _fetch_temporary_exhibitions_window_async(
                         len(content or ""),
                         (content or "")[:600],
                     )
-                    if not content or content.strip() in ("[]", ""):
+                    if run_status != "ok":
                         continue
                     data = _extract_json_array(content)
                     if data is None:
@@ -5371,6 +5434,11 @@ async def _fetch_temporary_exhibitions_window_async(
                     )
 
         if not combined:
+            if had_search_failures and not had_successful_search_response:
+                raise RuntimeError(
+                    "Temporary exhibition search failed before any valid search response. "
+                    f"Last error: {last_search_error or 'unknown'}"
+                )
             logger.warning("temp_search_empty city=%s raw=%r", city, last_raw[:2000])
             return []
 
