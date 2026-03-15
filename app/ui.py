@@ -472,8 +472,18 @@ def _run_job(state: RunState) -> None:
             _sanitize_df_for_excel(df_all).to_excel(writer, sheet_name="Exhibitions", index=False)
             _sanitize_df_for_excel(combinations).to_excel(writer, sheet_name="Combinations", index=False)
 
-        state.status = "ok" if any(cr["status"] == "ok" for cr in city_results) else "empty"
-        state.error = ""
+        if any(cr["status"] == "ok" for cr in city_results):
+            state.status = "ok"
+            state.error = ""
+        elif any(cr["status"] == "error" for cr in city_results):
+            state.status = "error"
+            state.error = next(
+                (str(cr.get("error") or "").strip() for cr in city_results if (cr.get("error") or "").strip()),
+                "One or more city searches failed.",
+            )
+        else:
+            state.status = "empty"
+            state.error = ""
         _set_run_progress(
             state,
             phase="completed",
