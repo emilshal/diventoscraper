@@ -4349,15 +4349,21 @@ async def _generate_temp_copy_async(
     return {"short": "", "long": ""}
 
 
-def _editorial_rating_caps(batch_size: int) -> tuple[int, int, int]:
+def _editorial_rating_targets(batch_size: int) -> tuple[int, int, int, int]:
     if batch_size <= 0:
-        return 0, 0, 0
-    max_fives = 0 if batch_size < 8 else (1 if batch_size < 25 else max(1, (batch_size + 19) // 20))
-    max_fours = 1 if batch_size < 4 else (2 if batch_size < 10 else max(3, (batch_size + 3) // 4))
-    max_fours = min(max_fours, max(0, batch_size - max_fives))
-    min_fours = 0 if batch_size < 4 else (1 if batch_size < 10 else 2)
-    min_fours = min(min_fours, max_fours)
-    return max_fives, max_fours, min_fours
+        return 0, 0, 0, 0
+    target_fives = 0 if batch_size < 18 else (1 if batch_size < 40 else max(1, (batch_size + 29) // 30))
+    target_fours = (
+        0
+        if batch_size < 4
+        else (1 if batch_size < 10 else (2 if batch_size < 18 else max(3, (batch_size + 5) // 6)))
+    )
+    max_twos = 0 if batch_size < 10 else (1 if batch_size < 24 else max(1, (batch_size + 17) // 18))
+    max_ones = 0 if batch_size < 35 else 1
+    target_fours = min(target_fours, max(0, batch_size - target_fives))
+    max_twos = min(max_twos, max(0, batch_size - target_fives - target_fours))
+    max_ones = min(max_ones, max(0, batch_size - target_fives - target_fours - max_twos))
+    return target_fives, target_fours, max_twos, max_ones
 
 
 async def _assign_city_editorial_ratings_async(rows: list[dict], *, city: str) -> list[str]:
@@ -4365,10 +4371,7 @@ async def _assign_city_editorial_ratings_async(rows: list[dict], *, city: str) -
         return []
 
     client = _get_openai_client()
-    if client is None:
-        return ["3"] * len(rows)
-
-    max_fives, max_fours, min_fours = _editorial_rating_caps(len(rows))
+    target_fives, target_fours, max_twos, max_ones = _editorial_rating_targets(len(rows))
     evidence_rows: list[dict] = []
     for idx, row in enumerate(rows):
         label = str(row.get("Name of site, City") or "").strip()
@@ -4390,29 +4393,17 @@ async def _assign_city_editorial_ratings_async(rows: list[dict], *, city: str) -
         )
 
     prompt = (
-        f"Assign Divento editorial ratings for a batch of temporary exhibitions in {city}.\n\n"
-        "Use this exact scale:\n"
-        "1 = Avoid\n"
-        "2 = Negligible interest\n"
-        "3 = Worth a look\n"
-        "4 = Worth planning for\n"
-        "5 = Worth a detour\n\n"
+        f"Rank a batch of temporary exhibitions in {city} from strongest to weakest for Divento editorial rating.\n\n"
+        "Do not assign final star ratings. Instead classify each exhibition into one evidence tier:\n"
+        "- exceptional = rare and major standout\n"
+        "- above_average = clearly above average and worth planning for\n"
+        "- average = competent or neutral exhibition; default when evidence is thin\n"
+        "- weak = minor, slight, or underwhelming exhibition\n"
+        "- poor = clearly weak or avoidable exhibition\n\n"
         "Judge independently from the available evidence. Do not copy or average ratings from other websites.\n"
-        "Calibration:\n"
-        "- 3 = average competent exhibition\n"
-        "- 4 = clearly above average\n"
-        "- 5 = rare and exceptional\n"
-        "- If evidence is thin or neutral, default to 3 unless there is strong reason otherwise.\n\n"
-        "Distribution guidance:\n"
-        "- Most exhibitions should be 3.\n"
-        f"- If this batch has clear standouts, make sure at least about {min_fours} exhibition(s) land at 4 rather than flattening every solid top pick to 3.\n"
-        f"- Keep rating 4 limited to about {max_fours} exhibitions in this batch.\n"
-        f"- Keep rating 5 very rare, at most about {max_fives} exhibitions in this batch.\n"
-        "- Use rating 2 for occasional minor or weak exhibitions.\n"
-        "- Use rating 1 only for rare clearly poor exhibitions.\n"
-        "- Avoid rating inflation.\n\n"
+        "Keep most exhibitions in average unless there is strong reason to move them up or down.\n"
         "Return a JSON array sorted from strongest exhibition to weakest exhibition.\n"
-        "Each object must have exactly these keys: 'id' and 'rating'.\n"
+        "Each object must have exactly these keys: 'id' and 'tier'.\n"
         "Include every id exactly once.\n\n"
         "EXHIBITIONS JSON\n"
         f"{json.dumps(evidence_rows, ensure_ascii=False)}"
@@ -4438,9 +4429,18 @@ async def _assign_city_editorial_ratings_async(rows: list[dict], *, city: str) -
                                 "additionalProperties": False,
                                 "properties": {
                                     "id": {"type": "integer"},
-                                    "rating": {"type": "integer", "enum": [1, 2, 3, 4, 5]},
+                                    "tier": {
+                                        "type": "string",
+                                        "enum": [
+                                            "exceptional",
+                                            "above_average",
+                                            "average",
+                                            "weak",
+                                            "poor",
+                                        ],
+                                    },
                                 },
-                                "required": ["id", "rating"],
+                                "required": ["id", "tier"],
                             },
                         },
                     },
@@ -4464,64 +4464,76 @@ async def _assign_city_editorial_ratings_async(rows: list[dict], *, city: str) -
             content = _clean_json_content(resp.output_text or _extract_response_text(resp) or "")
         except Exception as exc_obj:  # noqa: BLE001
             logger.debug("temp_city_rating_object_error city=%s err=%r", city, exc_obj)
-            return ["3"] * len(rows)
+            content = ""
 
     data = _extract_json_array(content) if content else None
     if not isinstance(data, list):
         logger.info("temp_city_rating_invalid_json city=%s", city)
-        return ["3"] * len(rows)
+        data = []
 
-    rating_by_id: dict[int, int] = {}
+    tier_by_id: dict[int, str] = {}
     ordered_ids: list[int] = []
     for item in data:
         if not isinstance(item, dict):
             continue
         try:
             idx = int(item.get("id"))
-            rating = int(item.get("rating"))
+            tier = str(item.get("tier") or "").strip().lower()
         except Exception:
             continue
-        if idx < 0 or idx >= len(rows) or rating not in (1, 2, 3, 4, 5) or idx in rating_by_id:
+        if idx < 0 or idx >= len(rows) or tier not in {
+            "exceptional",
+            "above_average",
+            "average",
+            "weak",
+            "poor",
+        } or idx in tier_by_id:
             continue
-        rating_by_id[idx] = rating
+        tier_by_id[idx] = tier
         ordered_ids.append(idx)
 
     for idx in range(len(rows)):
-        if idx not in rating_by_id:
-            rating_by_id[idx] = 3
+        if idx not in tier_by_id:
+            tier_by_id[idx] = "average"
             ordered_ids.append(idx)
 
     final_ratings = ["3"] * len(rows)
+    used_ones = 0
+    used_twos = 0
     used_fives = 0
+
+    for idx in reversed(ordered_ids):
+        tier = tier_by_id.get(idx, "average")
+        if tier == "poor" and used_ones < max_ones:
+            final_ratings[idx] = "1"
+            used_ones += 1
+
+    for idx in reversed(ordered_ids):
+        tier = tier_by_id.get(idx, "average")
+        if final_ratings[idx] != "3":
+            continue
+        if tier in {"weak", "poor"} and used_twos < max_twos:
+            final_ratings[idx] = "2"
+            used_twos += 1
+
     used_fours = 0
     for idx in ordered_ids:
-        rating = rating_by_id.get(idx, 3)
-        if rating == 5:
-            if used_fives < max_fives:
+        tier = tier_by_id.get(idx, "average")
+        if tier == "exceptional":
+            if used_fives < target_fives:
                 final_ratings[idx] = "5"
                 used_fives += 1
-            elif used_fours < max_fours:
+            elif used_fours < target_fours:
                 final_ratings[idx] = "4"
                 used_fours += 1
-            else:
-                final_ratings[idx] = "3"
-        elif rating == 4:
-            if used_fours < max_fours:
-                final_ratings[idx] = "4"
-                used_fours += 1
-            else:
-                final_ratings[idx] = "3"
-        elif rating in (1, 2, 3):
-            final_ratings[idx] = str(rating)
-        else:
-            final_ratings[idx] = "3"
+        elif tier == "above_average" and final_ratings[idx] == "3" and used_fours < target_fours:
+            final_ratings[idx] = "4"
+            used_fours += 1
 
-    if used_fours < min_fours:
+    if used_fours < target_fours:
         for idx in ordered_ids:
-            if used_fours >= min_fours:
+            if used_fours >= target_fours:
                 break
-            if rating_by_id.get(idx, 3) < 3:
-                continue
             if final_ratings[idx] != "3":
                 continue
             final_ratings[idx] = "4"
