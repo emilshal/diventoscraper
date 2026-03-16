@@ -4349,13 +4349,15 @@ async def _generate_temp_copy_async(
     return {"short": "", "long": ""}
 
 
-def _editorial_rating_caps(batch_size: int) -> tuple[int, int]:
+def _editorial_rating_caps(batch_size: int) -> tuple[int, int, int]:
     if batch_size <= 0:
-        return 0, 0
+        return 0, 0, 0
     max_fives = 0 if batch_size < 8 else (1 if batch_size < 25 else max(1, (batch_size + 19) // 20))
-    max_fours = 1 if batch_size < 6 else max(2, (batch_size + 4) // 5)
+    max_fours = 1 if batch_size < 4 else (2 if batch_size < 10 else max(3, (batch_size + 3) // 4))
     max_fours = min(max_fours, max(0, batch_size - max_fives))
-    return max_fives, max_fours
+    min_fours = 0 if batch_size < 4 else (1 if batch_size < 10 else 2)
+    min_fours = min(min_fours, max_fours)
+    return max_fives, max_fours, min_fours
 
 
 async def _assign_city_editorial_ratings_async(rows: list[dict], *, city: str) -> list[str]:
@@ -4366,7 +4368,7 @@ async def _assign_city_editorial_ratings_async(rows: list[dict], *, city: str) -
     if client is None:
         return ["3"] * len(rows)
 
-    max_fives, max_fours = _editorial_rating_caps(len(rows))
+    max_fives, max_fours, min_fours = _editorial_rating_caps(len(rows))
     evidence_rows: list[dict] = []
     for idx, row in enumerate(rows):
         label = str(row.get("Name of site, City") or "").strip()
@@ -4403,6 +4405,7 @@ async def _assign_city_editorial_ratings_async(rows: list[dict], *, city: str) -
         "- If evidence is thin or neutral, default to 3 unless there is strong reason otherwise.\n\n"
         "Distribution guidance:\n"
         "- Most exhibitions should be 3.\n"
+        f"- If this batch has clear standouts, make sure at least about {min_fours} exhibition(s) land at 4 rather than flattening every solid top pick to 3.\n"
         f"- Keep rating 4 limited to about {max_fours} exhibitions in this batch.\n"
         f"- Keep rating 5 very rare, at most about {max_fives} exhibitions in this batch.\n"
         "- Use rating 2 for occasional minor or weak exhibitions.\n"
@@ -4512,6 +4515,17 @@ async def _assign_city_editorial_ratings_async(rows: list[dict], *, city: str) -
             final_ratings[idx] = str(rating)
         else:
             final_ratings[idx] = "3"
+
+    if used_fours < min_fours:
+        for idx in ordered_ids:
+            if used_fours >= min_fours:
+                break
+            if rating_by_id.get(idx, 3) < 3:
+                continue
+            if final_ratings[idx] != "3":
+                continue
+            final_ratings[idx] = "4"
+            used_fours += 1
 
     logger.info(
         "temp_city_ratings city=%s count=%s dist_1=%s dist_2=%s dist_3=%s dist_4=%s dist_5=%s",
