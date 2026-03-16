@@ -21,6 +21,7 @@ from fake_useragent import UserAgent
 from dateutil import parser as date_parser
 from dateutil.relativedelta import relativedelta
 from openai import AsyncOpenAI
+from openpyxl.utils.exceptions import IllegalCharacterError
 
 from app.config import settings
 from app.core.ml import classify
@@ -37,6 +38,7 @@ _TEMP_VENUE_HOURS_CACHE: dict[str, dict[str, str]] = {}
 _TEMP_IMAGE_LICENSE_CACHE: dict[str, dict[str, str]] = {}
 _TEMP_DURATION_CACHE: dict[str, dict[str, str]] = {}
 _FORBIDDEN_TITLE_CHARS_RE = re.compile(r"[<>;=#{}]")
+_ILLEGAL_EXCEL_CHARS_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
 
 _VENUE_OPENING_INFO_FALLBACK = (
     getattr(settings, "TEMP_VENUE_HOURS_FALLBACK_VALUE", "See venue website")
@@ -726,6 +728,21 @@ def _sanitize_export_title(value: str) -> str:
     text = _FORBIDDEN_TITLE_CHARS_RE.sub("", text)
     text = re.sub(r"\s{2,}", " ", text)
     return text.strip()
+
+
+def _sanitize_excel_cell(value):
+    if isinstance(value, str):
+        return _ILLEGAL_EXCEL_CHARS_RE.sub("", value)
+    return value
+
+
+def _sanitize_dataframe_for_excel(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    clean = df.copy()
+    for col in clean.columns:
+        clean[col] = clean[col].map(_sanitize_excel_cell)
+    return clean
 
 
 def _dedupe_export_row_key(row: dict) -> str:
@@ -6327,8 +6344,17 @@ def scrape_destinations_temp(cities: list[str], months: int = 24) -> str:
     Path(settings.RESULT_DIR).mkdir(parents=True, exist_ok=True)
     out_path = Path(settings.RESULT_DIR) / f"{uuid.uuid4()}_places.xlsx"
 
-    combinations = _build_combinations_sheet(df)
-    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Exhibitions", index=False)
-        combinations.to_excel(writer, sheet_name="Combinations", index=False)
+    df_excel = _sanitize_dataframe_for_excel(df)
+    combinations = _sanitize_dataframe_for_excel(_build_combinations_sheet(df_excel))
+    try:
+        with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+            df_excel.to_excel(writer, sheet_name="Exhibitions", index=False)
+            combinations.to_excel(writer, sheet_name="Combinations", index=False)
+    except IllegalCharacterError:
+        logger.exception("temp_excel_illegal_character out_path=%s", out_path)
+        df_excel = _sanitize_dataframe_for_excel(df_excel)
+        combinations = _sanitize_dataframe_for_excel(combinations)
+        with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+            df_excel.to_excel(writer, sheet_name="Exhibitions", index=False)
+            combinations.to_excel(writer, sheet_name="Combinations", index=False)
     return str(out_path)
