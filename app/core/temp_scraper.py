@@ -4735,6 +4735,105 @@ async def _translate_bundle_async(
     return {lang: {"name": "", "short": "", "long": ""} for lang in languages}
 
 
+async def _normalise_exhibition_titles_to_english_async(
+    items: list[dict],
+    *,
+    city: str,
+) -> list[str]:
+    if not items:
+        return []
+
+    originals = [str(item.get("title") or "").strip() for item in items]
+    client = _get_openai_client()
+    if client is None:
+        return originals
+
+    payload = []
+    for idx, item in enumerate(items):
+        payload.append(
+            {
+                "id": idx,
+                "title": str(item.get("title") or "").strip(),
+                "venue": str(item.get("venue") or "").strip(),
+                "city": str(item.get("city") or "").strip(),
+                "country": str(item.get("country") or "").strip(),
+                "source_url": str(item.get("source_url") or "").strip(),
+            }
+        )
+
+    prompt = (
+        f"Normalize temporary exhibition titles into natural English for Divento's English master sheet for {city}.\n\n"
+        "Rules:\n"
+        "- If a title is already natural English, keep it unchanged.\n"
+        "- If a title appears in another language, translate it into natural English when the meaning is clear.\n"
+        "- Keep the original-language title only if no clear English translation exists or the exhibition is officially known by its original title.\n"
+        "- Return only the exhibition title itself; do not add venue, city, dates, or the word Exhibition.\n"
+        "- Preserve artist names and proper nouns naturally.\n"
+        "- Prefer clear, reader-friendly English over literal awkward phrasing.\n\n"
+        "Example:\n"
+        "Az öröklét őrei. Az első kínai császár agyagkatonái -> Guardians of Eternity: The Terracotta Army of China's First Emperor\n\n"
+        "Return ONLY a JSON array sorted in the same order as the input.\n"
+        "Each object must have exactly these keys: 'id', 'english_title'.\n\n"
+        "INPUT JSON\n"
+        f"{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+    content = ""
+    try:
+        resp = await _call_with_backoff(
+            lambda: client.responses.create(
+                model=TEMP_TRANSLATION_MODEL,
+                input=prompt,
+                reasoning={"effort": "low"},
+                text={
+                    "verbosity": "low",
+                    "format": {
+                        "type": "json_schema",
+                        "name": "temp_title_english_normalization",
+                        "strict": True,
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "id": {"type": "integer"},
+                                    "english_title": {"type": "string"},
+                                },
+                                "required": ["id", "english_title"],
+                            },
+                        },
+                    },
+                },
+                max_output_tokens=max(600, min(3000, 100 + len(items) * 25)),
+            )
+        )
+        content = _clean_json_content(resp.output_text or _extract_response_text(resp) or "")
+    except Exception as exc_schema:  # noqa: BLE001
+        logger.debug("temp_title_normalization_error city=%s err=%r", city, exc_schema)
+        return originals
+
+    data = _extract_json_array(content) if content else None
+    if not isinstance(data, list):
+        logger.info("temp_title_normalization_invalid_json city=%s", city)
+        return originals
+
+    normalized = originals[:]
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("id"))
+        except Exception:
+            continue
+        if idx < 0 or idx >= len(normalized):
+            continue
+        english_title = str(item.get("english_title") or "").strip()
+        if english_title:
+            normalized[idx] = english_title
+    return normalized
+
+
 def _build_combinations_sheet(df: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict] = []
     for _, row in df.iterrows():
@@ -4901,7 +5000,8 @@ async def _fetch_temporary_exhibitions_window_async(
         "- Prefer official venue/museum pages.\n\n"
         "Naming policy:\n"
         "- Prefer English-language official pages when available.\n"
-        "- Return the exhibition title exactly as written on the source_url page you used; do not translate it.\n\n"
+        "- If an exhibition title appears in a language other than English, translate it into natural English when the meaning is clear.\n"
+        "- Keep the original-language title only if no clear English translation exists or the exhibition is officially known by its original title.\n\n"
         "Venue strategy:\n"
         "- It is OK to return many exhibitions from the same venue if they are distinct and verifiable.\n"
         "- Do not artificially cap the number of exhibitions per venue.\n\n"
@@ -5854,6 +5954,37 @@ async def scrape_temporary_exhibitions_async(
         target_max=target_max,
     )
 
+    title_inputs: list[dict] = []
+    for ex in exhibitions:
+        raw_name = str(ex.get("name") or "").strip()
+        raw_head = (raw_name.split(":", 1)[0] if raw_name else "").strip()
+        parsed_title, _ = _split_exhibition_label(raw_head)
+        title_inputs.append(
+            {
+                "title": parsed_title or raw_head,
+                "venue": str(ex.get("venue") or "").strip(),
+                "city": str(ex.get("city") or city).strip(),
+                "country": str(ex.get("country") or "").strip(),
+                "source_url": str(ex.get("source_url") or "").strip(),
+            }
+        )
+    english_titles = await _normalise_exhibition_titles_to_english_async(title_inputs, city=city)
+    changed_titles = 0
+    for ex, title_en, original in zip(exhibitions, english_titles, title_inputs):
+        title_en = str(title_en or "").strip()
+        original_title = str(original.get("title") or "").strip()
+        if title_en:
+            ex["english_title"] = title_en
+            if title_en != original_title:
+                changed_titles += 1
+    if exhibitions:
+        logger.info(
+            "temp_title_english_normalized city=%s changed=%s total=%s",
+            city,
+            changed_titles,
+            len(exhibitions),
+        )
+
     rows: list[dict] = []
     copy_sem = asyncio.Semaphore(
         max(1, int(getattr(settings, "TEMP_COPY_CONCURRENCY", 2) or 2))
@@ -5886,6 +6017,7 @@ async def scrape_temporary_exhibitions_async(
         if not opening_hours:
             opening_hours = _VENUE_OPENING_INFO_FALLBACK
 
+        preferred_title = (ex.get("english_title") or "").strip()
         name_head = (name.split(":", 1)[0] if name else "").strip()
         parsed_title, _parsed_rest = _split_exhibition_label(name_head)
         exhibition_title_for_image = parsed_title or name_head
@@ -5901,10 +6033,9 @@ async def scrape_temporary_exhibitions_async(
         image_url = (image_meta.get("image_url") or "").strip()
         image_legend = _format_image_legend(image_meta)
 
-        title_for_copy = (
-            name.split(":", 1)[0].strip()
-            if name
-            else ", ".join([p for p in [venue, ex_city] if p])
+        raw_title_for_copy = name.split(":", 1)[0].strip() if name else ""
+        title_for_copy = preferred_title or raw_title_for_copy or ", ".join(
+            [p for p in [venue, ex_city] if p]
         )
 
         async with copy_sem:
@@ -5951,7 +6082,7 @@ async def scrape_temporary_exhibitions_async(
 
         city_label = ex_city or city
         cats = f"Top Exhibitions, Arts and Culture, Exhibitions in {city_label}".strip()
-        name_head = (name.split(":", 1)[0] if name else "").strip()
+        name_head = preferred_title or (name.split(":", 1)[0] if name else "").strip()
         name_head = re.sub(r"\(.*?\)", "", name_head).strip()
         title_seed = name_head or venue or city_label
         parts = (
