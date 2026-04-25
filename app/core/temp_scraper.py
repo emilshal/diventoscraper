@@ -1894,8 +1894,8 @@ def _validate_temp_copy(
         violations.append("long contains source citations/URLs")
 
     wc = _word_count_html(long_clean)
-    if wc < 280 or wc > 420:
-        violations.append(f"long word count should be near 350 (got {wc})")
+    if wc < 240 or wc > 310:
+        violations.append(f"long word count should be 250-300 (got {wc})")
 
     lead = _strip_html(long_clean)[:80].lower()
     if lead.startswith("explore "):
@@ -4155,6 +4155,8 @@ async def _generate_temp_copy_async(
     start_date: str,
     end_date: str,
     duration: str,
+    information: str = "",
+    source_url: str = "",
     avoid_short_openers: list[str] | None = None,
     avoid_long_openers: list[str] | None = None,
 ) -> dict[str, str]:
@@ -4195,70 +4197,93 @@ async def _generate_temp_copy_async(
         f"- Venue: {venue_for_copy}\n"
         f"- City: {city}\n"
         f"- Country: {country}\n"
+        f"- Verified information from discovery: {information}\n"
+        f"- Source URL for internal fact-checking only: {source_url}\n"
         "\n"
+        "GLOBAL PRIORITY\n"
+        f"- Base all content on verified factual sources, prioritising the official website of {venue_for_copy}.\n"
+        "- Extract concrete information (artists, works, themes, historical context) from the venue's official page where available.\n"
+        "- Rewrite all information in Divento style; do not copy text verbatim.\n"
+        "- Do not invent artworks, artists, dates, or interpretation.\n"
+        "- Ensure the exhibition described is a temporary exhibition, not a permanent collection display.\n\n"
         "HARD CONSTRAINTS (must pass)\n"
         "- Write as though the exhibition is already running; do not use future tense.\n"
         "- British English spelling.\n"
-        "- Keep it casual, like talking to a friend, while staying factual and concrete.\n"
-        "- Use natural rhythm and occasional contractions (it's, there's, don't) to avoid robotic phrasing.\n"
-        "- Make the writing flow: vary sentence length, use smooth transitions between ideas, and avoid a rigid checklist feel.\n"
+        "- Keep it natural and readable, with varied sentence structure.\n"
         "- Never use the first person.\n"
-        "- Do not address the reader directly (no second person).\n"
+        "- Do not address the reader directly.\n"
         "- Do not use these words anywhere: You, visitor, visitors, located, feature, featured, showcase, blend, period, accessible.\n"
-        "- Do not use em/en dash characters: — or –, except if they are part of the official exhibition title or venue name.\n"
+        "- Do not use em/en dash characters: — or –. If needed, rewrite with commas or parentheses.\n"
         "- Do not include citations, links, or URLs.\n"
         "- Do not mention the exhibition dates anywhere.\n"
-        "- Do not mention the visit duration/time-to-spend anywhere.\n"
-        "- Spell out numbers one to ten in words (no digits 1–10).\n"
-        "- Do not include the venue’s postal address (no street, postcode, or 'address is …').\n"
-        f"- When mentioning the venue name in the copy, always write it with a leading 'The' (capital T), matching: {venue_for_copy}.\n\n"
-        "LONG (HTML)\n"
-        "- Aim for 350 words.\n"
-        "- Multiple paragraphs; wrap each paragraph in <p> tags.\n"
-        "- Do not begin with the exhibition name, the venue name, or phrases like 'This exhibition'.\n"
-        "- Do not use formula openings such as: Across…, Through…, Inside…, At The venue…, In this show…\n"
-        "- Use an informal, easy to read style.\n"
-        "- Avoid concluding or summary-style final sentences.\n"
+        "- Do not mention visit duration or time-to-spend.\n"
+        "- Spell out numbers one to ten; use numerals from 11 upward (e.g. 23rd, 15th century).\n"
+        "- Do not include the venue's postal address.\n"
+        f"- When mentioning the venue, always write: {venue_for_copy}.\n\n"
+        "LONG DESCRIPTION (HTML)\n"
+        "- Target 250-300 words (do not exceed 300).\n"
+        "- Use multiple paragraphs, each wrapped in <p> tags.\n"
+        f"- Do not begin with the exhibition name, venue name, or 'This exhibition'.\n"
+        f"- Avoid formula openings such as: Across..., Through..., Inside..., At {venue_for_copy}..., In this show..., Explore...\n"
+        "- Do not end with a concluding or summary-style sentence.\n\n"
+        "STYLE AND CONTENT\n"
+        "- Use an informal, grounded tone with no promotional language.\n"
+        "- Prioritise concrete detail over interpretation or generalisation.\n"
+        "- Integrate naturally: one highlight, two don't-miss elements, and one lesser-known detail.\n"
+        "- Mention at least three specific artworks, objects, artefacts, installations, artists, or historical figures.\n"
+        "- Focus on what is actually shown or discussed, not vague themes.\n"
+        "- Avoid describing layout, rooms, galleries, or visitor flow.\n\n"
+        "SOURCE DISCIPLINE (CRITICAL)\n"
+        "- Anchor the text in verifiable facts drawn from the venue's official description.\n"
+        "- Prefer named works, artists, materials, dates, and themes explicitly mentioned by the venue.\n"
+        "- If specific works or details are not available, keep descriptions factual and restrained rather than expanding into generic interpretation.\n"
+        "- Do not add speculative or generic art commentary.\n\n"
+        "DATES (WHEN USED)\n"
         "- When a major historical figure is mentioned for the first time in the main body text, include dates immediately after the name in brackets using ASCII hyphens: Name (1840-1926) or Name (born 1929).\n"
-        "- Only include those dates on the first mention of that person.\n"
-        "- Do not add dates for curators, living gallery staff, or minor references unless they are historically significant.\n"
-        "- Use dates mainly for artists, architects, writers, collectors, rulers, and major historical figures.\n"
-        "OPENING STRATEGY (CRITICAL FOR VARIATION)\n"
-        "- Each exhibition description must open using a different narrative angle.\n"
-        "- Anchor the opening on why the exhibition is worth a visit.\n"
-        "- Do not prioritise the lay out of the exhibition.\n"
-        "- Avoid openings that mention rooms, spaces, galleries, displays, labels, or layout structure.\n"
-        "- Do not reuse opening sentence structure across exhibitions.\n"
-        "- Avoid physical walkthrough descriptions or layout framing.\n"
-        "- Avoid openings about rooms, galleries, spaces, layout, organisation, labels/interpretation panels, or sequences such as first/next/final.\n"
+        "- Only include dates for significant figures (artists, architects, writers, rulers).\n"
+        "- Do not overload with dates.\n\n"
+        "OPENING STRATEGY\n"
+        "- Each description must open with a different narrative angle.\n"
+        "- Anchor the opening on why the exhibition matters or what it centres on.\n"
+        "- Clearly identify the main subject early in the first sentence.\n"
+        "- Do not reuse opening structures across entries.\n"
         + f"{avoid_long_clause}"
-        "- Include naturally: one highlight, two don't-miss elements, and one hidden gem.\n"
-        "- Mention at least three specific works, artists, or items when possible.\n"
-        "- Use strong verbs, concrete nouns, active voice; cut filler.\n"
-        "- No brochure-style language, clichés, or exaggerated adjectives.\n\n"
-        "SHORT\n"
+        "\nSHORT DESCRIPTION\n"
         "- Maximum 164 characters.\n"
-        "- Write one concise factual sentence that explains what the exhibition is about and why it is worth visiting.\n"
-        "- It must still read naturally and include a verb.\n"
-        "- Must not repeat the exhibition name.\n"
-        "- Must not repeat the phrasing or start of the long description.\n\n"
-        "- Include a sentence identifying the subject of the exhibition and a reason to visit.\n"
-        "- The reason to visit should refer to artworks, objects, discoveries, or themes presented.\n"
-        "- Do not write pure teaser copy; prioritise a compact subject-led summary with a concrete reason to go.\n"
-        "- Keep it to roughly 20-25 words when possible, while always staying under 164 characters.\n"
-        "- If the exhibition is about a person, include name, role, nationality if relevant, and birth-death dates when known. If living, use '(born YEAR)'.\n"
-        "- If it is about an artistic movement, include the movement name and approximate period.\n"
-        "- If it is about a historical period, include the timeframe.\n"
-        "- If it is about a place or culture, briefly identify the location and historical context.\n"
-        "- If several subjects appear, identify the primary one only.\n"
-        "- Acceptable opening patterns include: subject first, subject within the opening clause, movement anchored at the start, or subject after a short opening phrase.\n"
-        "- Do not prioritise the lay out of the exhibition.\n"
-        "- The short description MUST NOT focus on rooms, spaces, galleries, displays, labels, or layout structure.\n"
-        "- Also avoid: exhibition organisation, interpretation panels, sequences such as first/next/final, or physical walkthrough descriptions.\n"
-        "- Do not start the short description with 'Explore'.\n"
+        "- One sentence only.\n"
+        "- Aim for 20-25 words where possible.\n\n"
+        "Must:\n"
+        "- Include a clear subject (person, movement, theme, culture, or historical focus).\n"
+        "- Include a specific reason to visit (artworks, objects, discoveries, or insight).\n"
+        "- Include at least one concrete detail (name, work, or timeframe where relevant).\n"
+        "- Contain a verb.\n"
+        "- Read naturally.\n\n"
+        "Must NOT:\n"
+        "- Repeat the exhibition title.\n"
+        "- Repeat the long description opening.\n"
+        "- Be vague or promotional.\n"
+        "- Focus on rooms, galleries, spaces, layout, exhibition organisation, labels, interpretation panels, sequences, or walkthrough descriptions.\n"
+        "- Start with Explore or similar formula phrases.\n\n"
+        "SUBJECT RULES (when relevant)\n"
+        "- Person -> include name and birth-death dates (or born YEAR).\n"
+        "- Movement -> include name and timeframe.\n"
+        "- Historical theme -> include timeframe.\n"
+        "- Culture/place -> include location and context.\n"
+        "- If multiple subjects exist, prioritise the main one.\n\n"
+        "SHORT DESCRIPTION - ACCEPTABLE OPENING PATTERNS\n"
+        "Follow these structural patterns, but vary wording and sentence construction. Do not copy phrasing.\n"
+        "- Subject first: Claude Monet (1840-1926), French Impressionist painter, explored changing light through water lilies, haystacks and Rouen Cathedral, bringing together key works from his major series.\n"
+        "- Subject within opening clause: Paintings by Claude Monet (1840-1926) show how the Impressionist painter studied changing light across repeated landscape series, with works often separated across collections.\n"
+        "- Movement anchored at start: The Bauhaus (1919-1933) reshaped modern design through radical teaching, experimental objects and functional architecture, with works showing how its ideas still shape design.\n"
+        "- Subject after opening phrase: Works by Yayoi Kusama (born 1929) explore repetition and infinity through immersive installations and mirrored environments.\n"
         f"{avoid_short_clause}"
+        "\n"
         "OUTPUT\n"
-        "- Return ONLY a JSON object with exactly the keys 'short' and 'long'.\n"
+        "Return ONLY a JSON object:\n"
+        "{\n"
+        '  "short": "...",\n'
+        '  "long": "..."\n'
+        "}\n"
         "- Both 'short' and 'long' must be non-empty strings.\n"
     )
 
@@ -6044,6 +6069,8 @@ async def scrape_temporary_exhibitions_async(
                 venue=venue,
                 city=ex_city,
                 country=country,
+                information=information,
+                source_url=source_url,
                 address=address,
                 start_date=start_date,
                 end_date=end_date or start_date,
