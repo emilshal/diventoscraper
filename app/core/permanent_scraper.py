@@ -32,6 +32,7 @@ import math
 import random
 import re
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -1481,3 +1482,193 @@ async def run_permanent_scrape(
         result_summary=summary,
     )
     return {"venues": all_venues, "summary": summary}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 5 — Excel writer (40-column shape matching the old save_excel())
+# ──────────────────────────────────────────────────────────────────────────────
+
+_PERM_EXCEL_COLUMNS = [
+    "Name of site, City",
+    "City",
+    "Country",
+    "Full address",
+    "Type(s) of activity",
+    "Divento Categories",
+    "Free activity?",
+    "Short description",
+    "Long description",
+    "Long description fr",
+    "Long description es",
+    "Long description it",
+    "Long description ru",
+    "Long description zh",
+    "URL of images",
+    "Legends of images",
+    "Duration of visit",
+    "Opening and closing time",
+    "Short description fr",
+    "Short description es",
+    "Short description it",
+    "Short description ru",
+    "Short description zh",
+    "Meta description",
+    "Meta description fr",
+    "Meta description es",
+    "Meta description it",
+    "Meta description ru",
+    "Meta description zh",
+    "Latitude",
+    "Information",
+    "Longitude",
+    "Activity type",
+    "Rating",
+    "Name of site city",
+    "Name of site city fr",
+    "Name of site city it",
+    "Name of site city ru",
+    "Name of site city zh",
+    "Name of site city es",
+    "Real city",
+]
+
+_ILLEGAL_EXCEL_CHARS_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
+
+
+def _excel_sanitize(value: Any) -> Any:
+    """Strip illegal control characters that openpyxl refuses to write."""
+    if isinstance(value, str):
+        return _ILLEGAL_EXCEL_CHARS_RE.sub("", value)
+    return value
+
+
+def _name_city_for_lang(name: str, city_translated: str, fallback_city: str) -> str:
+    return f"{name}, {city_translated or fallback_city}"
+
+
+def _venue_to_excel_row(venue: dict[str, Any]) -> list[Any]:
+    """Build the 41-cell row (matches _PERM_EXCEL_COLUMNS order). Sanitizes
+    each cell. Any missing field falls back to empty string."""
+    name = venue.get("name", "")
+    city = venue.get("city") or venue.get("real_city") or ""
+    country = venue.get("country", "")
+    address = venue.get("address", "")
+    rating = venue.get("rating")
+    rating_s = "" if rating is None else f"{rating}"
+    latitude = venue.get("latitude")
+    longitude = venue.get("longitude")
+    lat_s = "" if latitude is None else f"{latitude}"
+    lon_s = "" if longitude is None else f"{longitude}"
+    information = venue.get("official_url", "")
+    duration = venue.get("duration_hours")
+    duration_s = "" if duration is None else f"{duration}"
+    hours = venue.get("opening_hours", "")
+    photo_url = venue.get("photo_url", "")
+    photo_credit = venue.get("photo_credit", "")
+
+    copy = venue.get("copy") or {}
+    short_en = copy.get("short_en", "")
+    long_en = copy.get("long_en", "")
+    meta_en = copy.get("meta_en", "")
+    categories = copy.get("categories", "")
+
+    translations = venue.get("translations") or {}
+
+    def t(lang: str, field: str) -> str:
+        return (translations.get(lang) or {}).get(field, "") or ""
+
+    name_city = f"{name}, {city}" if city else name
+    row = [
+        name_city,                                # 0  Name of site, City
+        city,                                     # 1  City
+        country,                                  # 2  Country
+        address,                                  # 3  Full address
+        "",                                       # 4  Type(s) of activity (unused, matches old code)
+        categories,                               # 5  Divento Categories
+        "0",                                      # 6  Free activity? (matches old default)
+        short_en,                                 # 7  Short description
+        long_en,                                  # 8  Long description (English)
+        t("fr", "long"),                          # 9  Long description fr
+        t("es", "long"),                          # 10 Long description es
+        t("it", "long"),                          # 11 Long description it
+        t("ru", "long"),                          # 12 Long description ru
+        t("zh", "long"),                          # 13 Long description zh
+        photo_url,                                # 14 URL of images
+        photo_credit,                             # 15 Legends of images
+        duration_s,                               # 16 Duration of visit
+        hours,                                    # 17 Opening and closing time
+        t("fr", "short"),                         # 18 Short description fr
+        t("es", "short"),                         # 19 Short description es
+        t("it", "short"),                         # 20 Short description it
+        t("ru", "short"),                         # 21 Short description ru
+        t("zh", "short"),                         # 22 Short description zh
+        meta_en,                                  # 23 Meta description
+        t("fr", "meta"),                          # 24 Meta description fr
+        t("es", "meta"),                          # 25 Meta description es
+        t("it", "meta"),                          # 26 Meta description it
+        t("ru", "meta"),                          # 27 Meta description ru
+        t("zh", "meta"),                          # 28 Meta description zh
+        lat_s,                                    # 29 Latitude
+        information,                              # 30 Information (official URL)
+        lon_s,                                    # 31 Longitude
+        "",                                       # 32 Activity type (unused, matches old code)
+        rating_s,                                 # 33 Rating
+        name_city,                                # 34 Name of site city (English, dup of col 0)
+        _name_city_for_lang(name, t("fr", "city"), city),   # 35 Name of site city fr
+        _name_city_for_lang(name, t("it", "city"), city),   # 36 Name of site city it
+        _name_city_for_lang(name, t("ru", "city"), city),   # 37 Name of site city ru
+        _name_city_for_lang(name, t("zh", "city"), city),   # 38 Name of site city zh
+        _name_city_for_lang(name, t("es", "city"), city),   # 39 Name of site city es
+        city,                                     # 40 Real city
+    ]
+    return [_excel_sanitize(c) for c in row]
+
+
+def write_permanent_excel(
+    *,
+    venues: list[dict[str, Any]],
+    output_path: str | Path,
+    city: str | None = None,
+    country: str | None = None,
+) -> str:
+    """Write the 40-column permanent-attractions Excel file. `venues` must
+    already have `copy` and `translations` attached (run_permanent_scrape
+    does this). `city` and `country` are stamped onto venues that don't
+    already carry them (the search-phase venues don't, but the orchestrator
+    knows the city). Returns the path written."""
+    # openpyxl is heavy; import lazily so the module stays cheap to import.
+    from openpyxl import Workbook
+    from openpyxl.utils.exceptions import IllegalCharacterError
+
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Permanent venues"
+    ws.append(_PERM_EXCEL_COLUMNS)
+
+    rows_written = 0
+    for v in venues:
+        if not v.get("address"):
+            # Skip rows without an address (matches old save_excel() behavior).
+            continue
+        # Stamp city/country if not on the venue dict.
+        if city and not v.get("city"):
+            v["city"] = city
+        if city and not v.get("real_city"):
+            v["real_city"] = city
+        if country and not v.get("country"):
+            v["country"] = country
+        try:
+            ws.append(_venue_to_excel_row(v))
+            rows_written += 1
+        except IllegalCharacterError:
+            # Belt-and-braces: should already be handled by _excel_sanitize.
+            logger.warning("perm.excel.illegal_char venue=%s — retrying", v.get("name"))
+            ws.append([_excel_sanitize(str(c)) for c in _venue_to_excel_row(v)])
+            rows_written += 1
+
+    wb.save(out)
+    logger.info("perm.excel.wrote path=%s rows=%d", out, rows_written)
+    return str(out)

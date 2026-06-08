@@ -793,3 +793,173 @@ def download_report(run_id: str) -> JSONResponse:
         raise HTTPException(status_code=404, detail="report not found")
     payload = json.loads(Path(state.report_path).read_text(encoding="utf-8"))
     return JSONResponse(payload)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Permanent-scraper endpoints (AI-search-grounded, run-store persisted).
+# Cron `scrape_destinations.py` POSTs here and polls for status; the cron
+# loop holds open until status hits "done" or "error", mirroring how the
+# temporary scraper dispatcher works.
+# ──────────────────────────────────────────────────────────────────────────────
+
+import asyncio as _asyncio_perm
+
+from app.core.permanent_scraper import (
+    run_permanent_scrape as _perm_run_permanent_scrape,
+    write_permanent_excel as _perm_write_permanent_excel,
+)
+from app.core.run_store import (
+    close_store as _perm_close_store,
+    get_store as _perm_get_store,
+    init_store as _perm_init_store,
+)
+
+
+class PermanentRunRequest(BaseModel):
+    cities: list[str] = Field(default_factory=list)
+    country: str = "Italy"
+    min_reviews: int = 1000
+    target_min: int = 15
+    target_max: int = 50
+
+
+_PERM_DB_PATH = Path(settings.RESULT_DIR) / "permanent_runs.sqlite"
+
+
+@app.on_event("startup")
+async def _perm_startup() -> None:
+    Path(settings.RESULT_DIR).mkdir(parents=True, exist_ok=True)
+    await _perm_init_store(_PERM_DB_PATH)
+    # Mark any run that was mid-flight when the previous process died as
+    # errored — the cron will see the failure and the user can re-queue.
+    store = _perm_get_store()
+    stale = await store.mark_stale_as_error(max_age_seconds=15 * 60)
+    if stale:
+        logger.info("perm.startup.stale_runs_flipped count=%d", stale)
+
+
+@app.on_event("shutdown")
+async def _perm_shutdown() -> None:
+    await _perm_close_store()
+
+
+def _perm_excel_filename(*, cities: list[str], run_id: str) -> str:
+    """Mirrors the temp dispatcher convention: <slug>_<timestamp>_<run_id>_permanent.xlsx"""
+    primary = (cities[0] if cities else "permanent").lower()
+    slug = _slugify_filename_part(primary)[:32] or "permanent"
+    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    return f"{slug}_{stamp}_{run_id}_permanent.xlsx"
+
+
+async def _perm_run_async(
+    *,
+    run_id: str,
+    cities: list[str],
+    country: str,
+    min_reviews: int,
+    target_min: int,
+    target_max: int,
+) -> None:
+    """Run the full permanent pipeline in this asyncio loop. Called via
+    asyncio.create_task from the POST handler."""
+    store = _perm_get_store()
+    try:
+        result = await _perm_run_permanent_scrape(
+            run_id=run_id,
+            cities=cities,
+            country=country,
+            min_reviews=min_reviews,
+            target_min=target_min,
+            target_max=target_max,
+            run_store=store,
+        )
+        excel_filename = _perm_excel_filename(cities=cities, run_id=run_id)
+        excel_path = Path(settings.RESULT_DIR) / excel_filename
+        _perm_write_permanent_excel(
+            venues=result["venues"],
+            output_path=excel_path,
+            city=cities[0] if cities else None,
+            country=country,
+        )
+        await store.update_run(
+            run_id,
+            status="done",
+            current_phase="done",
+            progress_pct=100.0,
+            excel_path=str(excel_path),
+        )
+        logger.info("perm.run.done run_id=%s venues=%d", run_id, len(result["venues"]))
+    except Exception as exc:
+        logger.exception("perm.run.error run_id=%s err=%r", run_id, exc)
+        await store.update_run(
+            run_id,
+            status="error",
+            error_message=f"{type(exc).__name__}: {exc}",
+        )
+
+
+@app.post("/api/runs/permanent")
+async def perm_start_run(req: PermanentRunRequest) -> dict[str, Any]:
+    cities = [c.strip() for c in (req.cities or []) if c.strip()]
+    if settings.PERM_MAX_CITIES > 0:
+        cities = cities[: settings.PERM_MAX_CITIES]
+    if not cities:
+        raise HTTPException(status_code=400, detail="cities is required")
+    country = (req.country or "").strip() or "Italy"
+    min_reviews = max(0, int(req.min_reviews or 0))
+    target_min = max(1, int(req.target_min or 15))
+    target_max = max(target_min, int(req.target_max or 50))
+
+    store = _perm_get_store()
+    run_id = await store.create_run(
+        cities=cities,
+        min_reviews=min_reviews,
+        target_min=target_min,
+        target_max=target_max,
+    )
+    logger.info(
+        "perm.run.queued run_id=%s cities=%s country=%s target=%d-%d min_reviews=%d",
+        run_id, cities, country, target_min, target_max, min_reviews,
+    )
+    # Spawn in the same loop; FastAPI keeps the task alive until completion.
+    _asyncio_perm.create_task(
+        _perm_run_async(
+            run_id=run_id,
+            cities=cities,
+            country=country,
+            min_reviews=min_reviews,
+            target_min=target_min,
+            target_max=target_max,
+        )
+    )
+    return {"run_id": run_id, "status": "queued"}
+
+
+@app.get("/api/runs/permanent")
+async def perm_list_runs(status: str | None = None, limit: int = 20) -> dict[str, Any]:
+    store = _perm_get_store()
+    rows = await store.list_runs(status=status, limit=limit)
+    return {"runs": rows}
+
+
+@app.get("/api/runs/permanent/{run_id}")
+async def perm_get_run(run_id: str) -> dict[str, Any]:
+    store = _perm_get_store()
+    row = await store.get_run(run_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return row
+
+
+@app.get("/api/runs/permanent/{run_id}/excel")
+async def perm_download_excel(run_id: str) -> FileResponse:
+    store = _perm_get_store()
+    row = await store.get_run(run_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    if row.get("status") not in ("done",):
+        raise HTTPException(status_code=409, detail=f"run is {row.get('status')}")
+    excel_path = row.get("excel_path") or ""
+    if not excel_path or not Path(excel_path).exists():
+        raise HTTPException(status_code=404, detail="excel not found")
+    return FileResponse(excel_path, filename=Path(excel_path).name)
