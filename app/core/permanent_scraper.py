@@ -25,11 +25,14 @@ This module reuses several helpers from `temp_scraper`:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import math
 from typing import Any
 from urllib.parse import urlparse
+
+import requests
 
 from app.config import settings
 from app.core.run_store import RunStore
@@ -40,6 +43,7 @@ from app.core.temp_scraper import (
     _extract_json_object,
     _extract_response_text,
     _get_openai_client,
+    _lookup_venue_coords_async,
 )
 
 logger = logging.getLogger(__name__)
@@ -179,15 +183,21 @@ null for unknown numbers — never invent values):
   "name":            string,    // English name
   "name_local":      string,    // local-language name (or "" if same as name)
   "address":         string,    // full street address with postal code
-  "latitude":        number,
+  "latitude":        number,    // IMPORTANT: search for coordinates when not
+                                // immediately known. Only null if truly
+                                // unfindable after a focused web_search.
   "longitude":       number,
   "rating":          number,    // 0.0-5.0
   "reviews_count":   number,    // approximate, integer
   "official_url":    string,    // venue's own website if it has one
   "photo_url":       string,    // direct image URL (jpg/png/webp) — venue
                                 // exterior or main hall. NOT a thumbnail,
-                                // logo, or favicon. Prefer Wikipedia /
-                                // Wikimedia Commons / the official site.
+                                // logo, or favicon. Prefer Wikimedia Commons,
+                                // then Wikipedia, then the official venue
+                                // site. If none found after searching, leave
+                                // empty — do NOT use Google image-search
+                                // hotlinks, social media URLs, or stock-photo
+                                // sites.
   "photo_credit":    string,    // attribution line for the photo
   "opening_hours":   string,    // e.g. "Tue-Sun 9:00-18:00, closed Mondays".
                                 // Use "See venue website" if complex/seasonal.
@@ -382,8 +392,209 @@ async def search_city(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Phase 2 — enrich (stub — implemented in sub-checkpoint 2b)
+# Phase 2 — enrich
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+# City-center coords are looked up once per (city, country) and reused for the
+# sanity check on every venue in that city. Module-level cache is fine — the
+# FastAPI process is single-tenant and the cache is bounded by city count.
+_CITY_CENTER_CACHE: dict[str, tuple[float, float] | None] = {}
+
+
+async def _lookup_city_center(
+    *,
+    client,
+    city: str,
+    country: str,
+) -> tuple[float, float] | None:
+    """Single web_search call per (city, country). Returns (lat, lon) or None."""
+    key = f"{city.strip().lower()}|{country.strip().lower()}"
+    if key in _CITY_CENTER_CACHE:
+        return _CITY_CENTER_CACHE[key]
+
+    tools = [{"type": "web_search"}] if settings.PERM_ENABLE_WEB_SEARCH else None
+    prompt = (
+        f"What are the geographic coordinates of the center of {city}, {country}?\n"
+        'Return ONLY JSON: {"latitude": <number>, "longitude": <number>}.\n'
+        "Use decimal degrees. If unsure, return null for both."
+    )
+    try:
+        resp = await _call_with_backoff(
+            lambda: client.responses.create(
+                model=PERM_SEARCH_MODEL,
+                input=prompt,
+                tools=tools,
+                max_output_tokens=400,
+            ),
+            max_attempts=2,
+        )
+    except Exception as exc:
+        logger.warning("perm.city_center.error city=%s err=%r", city, exc)
+        _CITY_CENTER_CACHE[key] = None
+        return None
+
+    raw = resp.output_text or _extract_response_text(resp) or ""
+    obj = _extract_json_object(_clean_json_content(raw))
+    if not isinstance(obj, dict):
+        _CITY_CENTER_CACHE[key] = None
+        return None
+    lat = _coerce_float(obj.get("latitude"))
+    lon = _coerce_float(obj.get("longitude"))
+    if lat is None or lon is None:
+        _CITY_CENTER_CACHE[key] = None
+        return None
+    _CITY_CENTER_CACHE[key] = (lat, lon)
+    logger.info("perm.city_center city=%s lat=%s lon=%s", city, lat, lon)
+    return (lat, lon)
+
+
+def _head_check_image(url: str, *, timeout: float) -> bool:
+    """Run in a thread. True if HEAD returns 2xx and Content-Type starts with
+    image/. Falls back to a small GET if HEAD is rejected (some CDNs do 405)."""
+    if not url:
+        return False
+    headers = {"User-Agent": "Mozilla/5.0 (DiventoScraper/permanent)"}
+    try:
+        r = requests.head(url, timeout=timeout, allow_redirects=True, headers=headers)
+        if r.status_code == 405 or r.status_code == 403:
+            # Retry with a tiny GET — some hosts block HEAD.
+            r = requests.get(
+                url, timeout=timeout, allow_redirects=True, headers=headers, stream=True
+            )
+            r.close()
+        if r.status_code >= 400:
+            return False
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if ctype and not ctype.startswith("image/"):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+async def _verify_or_replace_photo(venue: dict[str, Any]) -> dict[str, Any]:
+    """HEAD-verify the photo_url; replace with fallback on failure."""
+    url = venue.get("photo_url") or ""
+    if not _is_likely_image_url(url):
+        if url:
+            logger.debug("perm.photo.reject_shape venue=%s url=%s", venue["name"], url)
+        venue["photo_url"] = settings.PERM_PHOTO_FALLBACK_URL
+        venue["photo_credit"] = ""
+        return venue
+
+    if not settings.PERM_PHOTO_VERIFY_ENABLED:
+        return venue
+
+    ok = await asyncio.to_thread(
+        _head_check_image, url, timeout=settings.PERM_PHOTO_VERIFY_TIMEOUT_S
+    )
+    if not ok:
+        logger.info("perm.photo.dead venue=%s url=%s", venue["name"], url)
+        venue["photo_url"] = settings.PERM_PHOTO_FALLBACK_URL
+        venue["photo_credit"] = ""
+    return venue
+
+
+async def _backfill_coords(
+    *,
+    client,
+    venue: dict[str, Any],
+    city: str,
+    country: str,
+) -> dict[str, Any]:
+    """If lat/lon is missing, call _lookup_venue_coords_async (reuses temp's
+    cache). Mutates and returns the venue dict."""
+    if venue.get("latitude") is not None and venue.get("longitude") is not None:
+        return venue
+    use_web = bool(settings.PERM_ENABLE_WEB_SEARCH)
+    coords = await _lookup_venue_coords_async(
+        client=client,
+        venue=venue["name"],
+        address=venue.get("address", ""),
+        city=city,
+        country=country,
+        use_web_search_tool=use_web,
+    )
+    if coords is None:
+        return venue
+    lat_s, lon_s, _src = coords
+    lat = _coerce_float(lat_s)
+    lon = _coerce_float(lon_s)
+    if lat is not None and lon is not None:
+        venue["latitude"] = lat
+        venue["longitude"] = lon
+        logger.debug(
+            "perm.coord.backfill venue=%s lat=%s lon=%s", venue["name"], lat, lon
+        )
+    return venue
+
+
+def _passes_coord_sanity(
+    *,
+    venue: dict[str, Any],
+    city_lat: float | None,
+    city_lon: float | None,
+) -> bool:
+    """Drop venues whose coords are clearly wrong (model hallucination or
+    wrong-city). Returns True if the venue should be kept."""
+    if not settings.PERM_COORD_SANITY_CHECK_ENABLED:
+        return True
+    if city_lat is None or city_lon is None:
+        return True  # Can't check; don't reject.
+    lat = venue.get("latitude")
+    lon = venue.get("longitude")
+    if lat is None or lon is None:
+        # Missing coords are NOT a sanity-check failure — they'll get
+        # an empty cell in Excel. Caller decides whether to drop missing-coord
+        # venues separately.
+        return True
+    dist = _haversine_km(city_lat, city_lon, lat, lon)
+    if dist > settings.PERM_COORD_MAX_DRIFT_KM:
+        logger.warning(
+            "perm.coord.sanity_fail venue=%s lat=%s lon=%s dist_km=%.1f",
+            venue["name"],
+            lat,
+            lon,
+            dist,
+        )
+        return False
+    return True
+
+
+def _backfill_hours_duration(venue: dict[str, Any]) -> dict[str, Any]:
+    """Trivial fallbacks for empty hours / duration."""
+    if not venue.get("opening_hours"):
+        venue["opening_hours"] = settings.PERM_VENUE_HOURS_FALLBACK_VALUE
+    if venue.get("duration_hours") is None:
+        venue["duration_hours"] = settings.PERM_DURATION_FALLBACK_HOURS
+    return venue
+
+
+async def _enrich_one_venue(
+    *,
+    client,
+    venue: dict[str, Any],
+    city: str,
+    country: str,
+    city_lat: float | None,
+    city_lon: float | None,
+    coord_sem: asyncio.Semaphore,
+    photo_sem: asyncio.Semaphore,
+) -> dict[str, Any] | None:
+    """Run all enrichment steps for one venue. Returns the venue dict (mutated)
+    or None if the sanity check drops it."""
+    async with coord_sem:
+        venue = await _backfill_coords(client=client, venue=venue, city=city, country=country)
+
+    if not _passes_coord_sanity(venue=venue, city_lat=city_lat, city_lon=city_lon):
+        return None
+
+    async with photo_sem:
+        venue = await _verify_or_replace_photo(venue)
+
+    venue = _backfill_hours_duration(venue)
+    return venue
 
 
 async def enrich_venues(
@@ -391,15 +602,57 @@ async def enrich_venues(
     client,
     city: str,
     country: str,
-    city_lat: float | None,
-    city_lon: float | None,
     venues: list[dict[str, Any]],
     run_store: RunStore | None = None,
     run_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Coord sanity check + photo HEAD-verify + hours/duration backfill.
-    Implemented in sub-checkpoint 2b."""
-    raise NotImplementedError("enrich_venues — implemented in sub-checkpoint 2b")
+    """Coord backfill + sanity check + photo HEAD-verify + hours/duration fallback.
+
+    Concurrency: coord backfill calls hit OpenAI (bound by PERM_GEO_CONCURRENCY);
+    photo HEAD-checks are local network calls (bound by PERM_PHOTO_VERIFY_CONCURRENCY).
+    Each venue is checkpointed to run_store on success so a restart resumes
+    where we left off.
+    """
+    if not venues:
+        return []
+
+    center = await _lookup_city_center(client=client, city=city, country=country)
+    city_lat, city_lon = (center if center is not None else (None, None))
+
+    coord_sem = asyncio.Semaphore(max(1, settings.PERM_GEO_CONCURRENCY))
+    photo_sem = asyncio.Semaphore(max(1, settings.PERM_PHOTO_VERIFY_CONCURRENCY))
+
+    async def _wrap(v: dict[str, Any]) -> dict[str, Any] | None:
+        try:
+            out = await _enrich_one_venue(
+                client=client,
+                venue=v,
+                city=city,
+                country=country,
+                city_lat=city_lat,
+                city_lon=city_lon,
+                coord_sem=coord_sem,
+                photo_sem=photo_sem,
+            )
+        except Exception as exc:
+            logger.exception(
+                "perm.enrich.venue_error venue=%s err=%r", v.get("name"), exc
+            )
+            return None
+        if out is not None and run_store is not None and run_id is not None:
+            await run_store.mark_venue_enriched(run_id, out["venue_id"], out)
+        return out
+
+    results = await asyncio.gather(*[_wrap(v) for v in venues])
+    kept = [r for r in results if r is not None]
+    logger.info(
+        "perm.enrich.city done city=%s in=%d kept=%d dropped=%d",
+        city,
+        len(venues),
+        len(kept),
+        len(venues) - len(kept),
+    )
+    return kept
 
 
 # ──────────────────────────────────────────────────────────────────────────────
