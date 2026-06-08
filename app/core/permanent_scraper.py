@@ -1387,6 +1387,262 @@ async def _copy_and_translate_one(
         return None
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Editorial ratings — model assigns evidence tiers per venue, deterministic
+# post-processing distributes 1-5 stars with batch-size-aware targets so a
+# city of 16 famous landmarks doesn't end up with 16 fives.
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _editorial_rating_targets(batch_size: int) -> tuple[int, int, int, int]:
+    """Returns (target_fives, target_fours, max_twos, max_ones). Tuned for
+    permanent batches (typically 10-25 famous sites) — a touch more generous
+    than the temp scraper's helper so a curated city list gets meaningful
+    differentiation rather than a flat sea of 3s. Most rows still default to 3."""
+    if batch_size <= 0:
+        return 0, 0, 0, 0
+    # 5s: 1 starting at 10 venues, scales up at 30+
+    target_fives = 0 if batch_size < 10 else (1 if batch_size < 30 else max(1, (batch_size + 19) // 20))
+    # 4s: ~1 per 5 venues, capped relative to batch
+    target_fours = (
+        0
+        if batch_size < 4
+        else (1 if batch_size < 8 else max(2, (batch_size + 4) // 5))
+    )
+    max_twos = 0 if batch_size < 8 else (1 if batch_size < 20 else max(1, (batch_size + 14) // 15))
+    max_ones = 0 if batch_size < 30 else 1
+    target_fours = min(target_fours, max(0, batch_size - target_fives))
+    max_twos = min(max_twos, max(0, batch_size - target_fives - target_fours))
+    max_ones = min(max_ones, max(0, batch_size - target_fives - target_fours - max_twos))
+    return target_fives, target_fours, max_twos, max_ones
+
+
+def _strip_html_for_evidence(value: str) -> str:
+    """Cheap HTML strip + whitespace collapse for the rating prompt evidence."""
+    if not value:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", value)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+async def _assign_city_editorial_ratings_perm_async(
+    venues: list[dict[str, Any]],
+    *,
+    city: str,
+) -> list[str]:
+    """Model assigns each venue an evidence tier; we then distribute 1-5 star
+    ratings according to PERM-batch-size targets. Returns a list of stringy
+    digits, same length and order as `venues`. Defaults to "3" on any failure
+    so a flaky run never leaves rating blank.
+
+    Evidence: venue name + short_en + meta_en + first ~240 chars of long_en
+    + city + Divento categories. We do NOT include reviews/ratings from
+    search (they're always null anyway) — judgment is entirely on the
+    written evidence."""
+    if not venues:
+        return []
+
+    import json as _json
+
+    client = _get_openai_client()
+    target_fives, target_fours, max_twos, max_ones = _editorial_rating_targets(len(venues))
+
+    evidence_rows: list[dict[str, Any]] = []
+    for idx, v in enumerate(venues):
+        copy = v.get("copy") or {}
+        long_excerpt = _strip_html_for_evidence(copy.get("long_en", ""))
+        if len(long_excerpt) > 240:
+            long_excerpt = long_excerpt[:237].rsplit(" ", 1)[0].strip() + "..."
+        evidence_rows.append(
+            {
+                "id": idx,
+                "name": v.get("name", ""),
+                "categories": copy.get("categories", ""),
+                "short": copy.get("short_en", ""),
+                "meta": copy.get("meta_en", ""),
+                "long_excerpt": long_excerpt,
+            }
+        )
+
+    prompt = (
+        f"Rank a batch of permanent visitor attractions in {city} from strongest to weakest "
+        "for Divento editorial rating.\n\n"
+        "Do not assign final star ratings. Instead classify each attraction into one evidence tier:\n"
+        "- exceptional = world-class landmark, the kind of place a traveller plans an entire trip around (UNESCO sites, top-3-in-country museums, iconic monuments)\n"
+        "- above_average = clearly above average and worth planning for; major museum, important monument, or distinctive cultural site\n"
+        "- average = competent attraction worth a visit; default when evidence is thin\n"
+        "- weak = minor or specialist site of limited general interest\n"
+        "- poor = clearly weak or skippable for most travellers\n\n"
+        "Judge from the written evidence (name, categories, descriptions). Consider historical significance, "
+        "scale of collection or site, architectural importance, and uniqueness.\n"
+        "Keep most attractions in average unless there is clear reason to move them up or down.\n"
+        "Famous landmarks (cathedrals, world-class galleries, UNESCO sites) typically warrant exceptional or above_average.\n"
+        "Smaller specialist museums or minor sites typically warrant average or weak.\n"
+        "Return a JSON array sorted from strongest attraction to weakest attraction.\n"
+        "Each object must have exactly these keys: 'id' and 'tier'.\n"
+        "Include every id exactly once.\n\n"
+        "ATTRACTIONS JSON\n"
+        f"{_json.dumps(evidence_rows, ensure_ascii=False)}"
+    )
+
+    # Responses API requires the root schema to be an object — wrap the
+    # ranked array in a `rankings` field. Parser unwraps it below.
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "rankings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "tier": {
+                            "type": "string",
+                            "enum": ["exceptional", "above_average", "average", "weak", "poor"],
+                        },
+                    },
+                    "required": ["id", "tier"],
+                },
+            },
+        },
+        "required": ["rankings"],
+    }
+    max_tokens = max(900, min(4000, 100 + len(venues) * 30))
+
+    content = ""
+    try:
+        resp = await _call_with_backoff(
+            lambda: client.responses.create(
+                model=PERM_COPY_MODEL,
+                input=prompt,
+                reasoning={"effort": "medium"},
+                text={
+                    "verbosity": "low",
+                    "format": {
+                        "type": "json_schema",
+                        "name": "perm_city_editorial_ratings",
+                        "strict": True,
+                        "schema": schema,
+                    },
+                },
+                max_output_tokens=max_tokens,
+            )
+        )
+        content = _clean_json_content(resp.output_text or _extract_response_text(resp) or "")
+    except Exception as exc:
+        logger.warning("perm.rating.schema_failed city=%s err=%r", city, exc)
+        try:
+            resp = await _call_with_backoff(
+                lambda: client.responses.create(
+                    model=PERM_COPY_MODEL,
+                    input=prompt,
+                    reasoning={"effort": "medium"},
+                    text={"verbosity": "low", "format": {"type": "json_object"}},
+                    max_output_tokens=max_tokens,
+                )
+            )
+            content = _clean_json_content(resp.output_text or _extract_response_text(resp) or "")
+        except Exception as exc2:
+            logger.error("perm.rating.error city=%s err=%r", city, exc2)
+            content = ""
+
+    data = None
+    if content:
+        obj = _extract_json_object(content)
+        if isinstance(obj, dict):
+            inner = obj.get("rankings")
+            if isinstance(inner, list):
+                data = inner
+        if data is None:
+            # Legacy / fallback: maybe the model returned a bare array anyway.
+            arr = _extract_json_array(content)
+            if isinstance(arr, list):
+                data = arr
+    if not isinstance(data, list):
+        logger.info("perm.rating.invalid_json city=%s — defaulting all to 3", city)
+        return ["3"] * len(venues)
+
+    tier_by_id: dict[int, str] = {}
+    ordered_ids: list[int] = []
+    valid_tiers = {"exceptional", "above_average", "average", "weak", "poor"}
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("id"))
+            tier = str(item.get("tier") or "").strip().lower()
+        except Exception:
+            continue
+        if idx < 0 or idx >= len(venues) or tier not in valid_tiers or idx in tier_by_id:
+            continue
+        tier_by_id[idx] = tier
+        ordered_ids.append(idx)
+
+    # Fill any missing rows with average, preserving original order at the tail.
+    for idx in range(len(venues)):
+        if idx not in tier_by_id:
+            tier_by_id[idx] = "average"
+            ordered_ids.append(idx)
+
+    final_ratings = ["3"] * len(venues)
+    used_ones = 0
+    used_twos = 0
+    used_fives = 0
+    used_fours = 0
+
+    # Bottom: distribute 1s then 2s starting from the weakest end.
+    for idx in reversed(ordered_ids):
+        tier = tier_by_id.get(idx, "average")
+        if tier == "poor" and used_ones < max_ones:
+            final_ratings[idx] = "1"
+            used_ones += 1
+    for idx in reversed(ordered_ids):
+        tier = tier_by_id.get(idx, "average")
+        if final_ratings[idx] != "3":
+            continue
+        if tier in {"weak", "poor"} and used_twos < max_twos:
+            final_ratings[idx] = "2"
+            used_twos += 1
+
+    # Top: 5s first to exceptional, then 4s to remaining exceptional + above_average.
+    for idx in ordered_ids:
+        tier = tier_by_id.get(idx, "average")
+        if tier == "exceptional":
+            if used_fives < target_fives:
+                final_ratings[idx] = "5"
+                used_fives += 1
+            elif used_fours < target_fours:
+                final_ratings[idx] = "4"
+                used_fours += 1
+        elif tier == "above_average" and final_ratings[idx] == "3" and used_fours < target_fours:
+            final_ratings[idx] = "4"
+            used_fours += 1
+
+    # If we haven't hit target_fours yet, promote the strongest remaining 3s.
+    if used_fours < target_fours:
+        for idx in ordered_ids:
+            if used_fours >= target_fours:
+                break
+            if final_ratings[idx] != "3":
+                continue
+            final_ratings[idx] = "4"
+            used_fours += 1
+
+    logger.info(
+        "perm.rating.city city=%s n=%d dist=1×%d 2×%d 3×%d 4×%d 5×%d",
+        city,
+        len(final_ratings),
+        final_ratings.count("1"),
+        final_ratings.count("2"),
+        final_ratings.count("3"),
+        final_ratings.count("4"),
+        final_ratings.count("5"),
+    )
+    return final_ratings
+
+
 async def run_permanent_scrape(
     *,
     run_id: str,
@@ -1463,6 +1719,15 @@ async def run_permanent_scrape(
         ]
         results = await asyncio.gather(*tasks)
         kept = [r for r in results if r is not None]
+
+        if kept:
+            await run_store.update_run(
+                run_id, status="translating", current_phase="rating"
+            )
+            ratings = await _assign_city_editorial_ratings_perm_async(kept, city=city)
+            for v, r in zip(kept, ratings):
+                v["rating"] = r
+
         summary[city] = len(kept)
         all_venues.extend(kept)
         logger.info(

@@ -12,6 +12,10 @@ __pycache__/
 data/*.xlsx
 data/*.numbers
 data/*_run_report.json
+data/*.sqlite
+data/*.sqlite-journal
+data/*.sqlite-wal
+data/*.sqlite-shm
 
 # Local copies from droplet (not part of this repo)
 divento-scrapper/
