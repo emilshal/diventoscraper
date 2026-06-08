@@ -19,3 +19,11 @@ diventoscrapper/
 
 # Local runtime logs
 logs/
+
+# Claude Code tooling (memory, agent journals, worktree state)
+.claude/
+
+# Local artifacts pulled off the compromised droplet for forensics/audit.
+# Contains old .env files (now-rotated secrets), DB dumps, forensics bundle,
+# and the quarantined malware. NEVER commit.
+untrusted-from-compromised-box/
