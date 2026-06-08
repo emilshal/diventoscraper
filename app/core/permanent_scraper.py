@@ -474,10 +474,15 @@ def _head_check_image(url: str, *, timeout: float) -> bool:
                     url, timeout=timeout, allow_redirects=True, headers=headers, stream=True
                 )
                 r.close()
-            if r.status_code == 429 or 500 <= r.status_code < 600:
-                return None  # retryable
+            if r.status_code == 429 or 400 <= r.status_code < 500 and r.status_code != 404:
+                # Wikimedia returns 400 for genuine throttling, not just 429.
+                # 404 is a real "doesn't exist". Other 4xx (400/403/429) are
+                # retry-worthy under burst load.
+                return None
+            if 500 <= r.status_code < 600:
+                return None
             if r.status_code >= 400:
-                return False
+                return False  # confirmed 404 / not-found
             ctype = (r.headers.get("Content-Type") or "").lower()
             if ctype and not ctype.startswith("image/"):
                 return False
@@ -485,12 +490,15 @@ def _head_check_image(url: str, *, timeout: float) -> bool:
         except requests.exceptions.RequestException:
             return None  # network glitch, retry
 
-    first = _attempt()
-    if first is not None:
-        return first
-    time.sleep(0.5 + random.random() * 0.5)
-    second = _attempt()
-    return bool(second)
+    # Up to 3 attempts with exponential-ish backoff. Wikimedia is sensitive to
+    # bursts even at concurrency=2, and we'd rather burn 2s on a retry than
+    # ship a placeholder for a venue that has a real photo.
+    for attempt_idx in range(3):
+        result = _attempt()
+        if result is not None:
+            return result
+        time.sleep(0.5 * (attempt_idx + 1) + random.random() * 0.5)
+    return False
 
 
 _PERM_PHOTO_CACHE: dict[str, dict[str, str] | None] = {}
@@ -549,6 +557,33 @@ def _commons_file_url(filename: str, *, thumb_size: int = 1200, timeout: float =
     return None
 
 
+def _pick_best_wikipedia_hit(hits: list[dict[str, Any]], *, venue_name: str) -> str | None:
+    """Of the top N search hits, pick the page whose title shares the most
+    distinctive tokens with the venue name. Handles cases like searching for
+    'Florence Baptistery' returning [Florence Cathedral, Florence, Florence
+    Baptistery, ...]; the Baptistery hit at #3 is what we actually want."""
+    if not hits:
+        return None
+    venue_tokens = _venue_name_match_tokens(venue_name)
+    if not venue_tokens:
+        return hits[0].get("title")
+    best_title: str | None = None
+    best_score = -1
+    for h in hits:
+        title = h.get("title") or ""
+        if not title:
+            continue
+        title_tokens = _venue_name_match_tokens(title)
+        score = len(venue_tokens & title_tokens)
+        if score > best_score:
+            best_score = score
+            best_title = title
+    # If no hit shares any distinctive tokens with the venue, fall back to #1.
+    if best_score <= 0:
+        return hits[0].get("title")
+    return best_title
+
+
 def _wikipedia_lookup_photo(
     *,
     venue_name: str,
@@ -568,7 +603,13 @@ def _wikipedia_lookup_photo(
     Returns dict {image_url, page_url, credit, page_title} or None. Sync;
     callers should wrap in asyncio.to_thread."""
     headers = {"User-Agent": _WIKIPEDIA_UA, "Accept": "application/json"}
-    query = f"{venue_name} {city}".strip()
+    # Skip appending city when the venue name already contains it (e.g.
+    # "Florence Baptistery Florence" dilutes the search; with just
+    # "Florence Baptistery" the Baptistery page hits #1).
+    if city.lower() in venue_name.lower():
+        query = venue_name.strip()
+    else:
+        query = f"{venue_name} {city}".strip()
     try:
         r = requests.get(
             _WIKIPEDIA_API,
@@ -577,7 +618,7 @@ def _wikipedia_lookup_photo(
                 "list": "search",
                 "srsearch": query,
                 "format": "json",
-                "srlimit": 1,
+                "srlimit": 3,
             },
             headers=headers,
             timeout=timeout,
@@ -585,16 +626,35 @@ def _wikipedia_lookup_photo(
         hits = (r.json().get("query") or {}).get("search") or []
         if not hits:
             return None
-        page_title = hits[0]["title"]
+        page_title = _pick_best_wikipedia_hit(hits, venue_name=venue_name) or hits[0]["title"]
     except Exception as exc:
         logger.debug("perm.photo.wikipedia_search_err venue=%s err=%r", venue_name, exc)
         return None
 
     page_url = f"https://en.wikipedia.org/wiki/{page_title.replace(' ', '_')}"
     credit = f"Wikipedia / Wikimedia Commons — {page_title}"
+    # Token-match against the page title too — handles the
+    # English→Italian filename mismatch (e.g. venue "National Archaeological
+    # Museum of Florence" → tokens {'archaeological'} doesn't match the Italian
+    # filename Museo_archeologico_nazionale.jpg, but the Wikipedia page title
+    # is "National Archaeological Museum, Florence" so tokenizing that gives
+    # back English tokens that match the page's English description).
     name_tokens = _venue_name_match_tokens(venue_name, name_local=name_local)
+    page_title_tokens = _venue_name_match_tokens(page_title)
+    all_tokens = name_tokens | page_title_tokens
 
-    # Step 2: pageimages fast path.
+    # Step 2: pageimages fast path. Accept if the pageimage filename matches
+    # a venue/page-title token, OR if the Wikipedia page title clearly
+    # corresponds to the venue (covers English↔Italian filename mismatches
+    # like "Archaeological" → "archeologico"). The page_title-corresponds
+    # check requires a strong overlap between venue tokens and page-title
+    # tokens — that prevents the Uffizi/Caravaggio-painting false positive
+    # because the search page title for "Uffizi Gallery" is "Uffizi" and
+    # both share the strong `uffizi` token, but for the rare false-positive
+    # case the search would return a totally different page title.
+    page_title_matches_venue = bool(
+        name_tokens and page_title_tokens and (name_tokens & page_title_tokens)
+    )
     try:
         r = requests.get(
             _WIKIPEDIA_API,
@@ -612,7 +672,12 @@ def _wikipedia_lookup_photo(
         for p in pages.values():
             thumb = (p.get("thumbnail") or {}).get("source")
             page_filename = (p.get("pageimage") or "").lower()
-            if thumb and (not name_tokens or any(t in page_filename for t in name_tokens)):
+            if not thumb:
+                continue
+            filename_matches_token = (
+                not all_tokens or any(t in page_filename for t in all_tokens)
+            )
+            if filename_matches_token or page_title_matches_venue:
                 return {
                     "image_url": thumb,
                     "page_url": page_url,
@@ -646,7 +711,7 @@ def _wikipedia_lookup_photo(
                     continue
                 if any(s in lower for s in ("logo", "commons-logo", "icon", "wikidata", "coa", "flag")):
                     continue
-                if not name_tokens or not any(t in lower for t in name_tokens):
+                if not all_tokens or not any(t in lower for t in all_tokens):
                     continue
                 url = _commons_file_url(title, thumb_size=thumb_size, timeout=timeout)
                 if url:
