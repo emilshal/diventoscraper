@@ -17,6 +17,10 @@ data/*.sqlite-journal
 data/*.sqlite-wal
 data/*.sqlite-shm
 
+# Laravel storage path the dispatcher writes to in production; if the cron
+# script ran locally during dev/testing it created these dirs — don't track.
+storage/
+
 # Local copies from droplet (not part of this repo)
 divento-scrapper/
 diventoscrapper/
