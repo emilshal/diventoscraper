@@ -66,6 +66,48 @@ class Settings(BaseSettings):
     # `0` means "no explicit cap", but we still clamp to `TEMP_ABSOLUTE_MAX_TOTAL_EXHIBITIONS`.
     TEMP_TOTAL_MAX_EXHIBITIONS: int = 0
     TEMP_ABSOLUTE_MAX_TOTAL_EXHIBITIONS: int = 0
+
+    # ────────────────────────────────────────────────────────────────────────
+    # Permanent venues scraper (web-search-grounded, no Google Places).
+    # Parallel to the TEMP_* knobs above. Replaces the Google Places +
+    # gpt-4.1-mini path that used to live in scrape_destinations.py.
+    # ────────────────────────────────────────────────────────────────────────
+    OPENAI_PERM_MODEL: str = "gpt-5.2"
+    OPENAI_PERM_SEARCH_MODEL: str | None = None  # falls back to OPENAI_PERM_MODEL
+    OPENAI_PERM_COPY_MODEL: str = "gpt-5.2"
+    OPENAI_PERM_TRANSLATION_MODEL: str = "gpt-5.2"
+    OPENAI_PERM_TRANSLATION_FALLBACK_MODEL: str = "gpt-5.2"
+    # Concurrency knobs.
+    PERM_COPY_CONCURRENCY: int = 2
+    PERM_TRANSLATION_CONCURRENCY: int = 4
+    PERM_GEO_CONCURRENCY: int = 4
+    PERM_VENUE_HOURS_BACKFILL_CONCURRENCY: int = 4
+    PERM_PHOTO_VERIFY_CONCURRENCY: int = 8
+    # Search strategy.
+    PERM_SEARCH_PASSES: int = 5
+    PERM_TARGET_MIN_VENUES: int = 15
+    PERM_TARGET_MAX_VENUES: int = 50
+    PERM_HARD_MAX_VENUES: int = 200       # safety cap to bound a runaway prompt
+    PERM_SEARCH_PASS_MAX_ITEMS: int = 60  # cap items returned per search pass
+    # Min reviews/popularity filter (caller sets, but we cap).
+    PERM_DEFAULT_MIN_REVIEWS: int = 1000
+    # Photo URL handling.
+    PERM_PHOTO_VERIFY_ENABLED: int = 1     # HEAD-check each photo URL, drop dead ones
+    PERM_PHOTO_VERIFY_TIMEOUT_S: float = 5.0
+    PERM_PHOTO_FALLBACK_URL: str = "https://placehold.co/1200x800/png?text=Divento"
+    # Coordinate sanity check — reject anything outside reasonable city bbox.
+    PERM_COORD_SANITY_CHECK_ENABLED: int = 1
+    PERM_COORD_MAX_DRIFT_KM: float = 50.0  # if model gives a venue >50km from city center, reject
+    # Hours/duration backfill defaults.
+    PERM_VENUE_HOURS_FALLBACK_VALUE: str = "See venue website"
+    PERM_DURATION_FALLBACK_HOURS: float = 2.0
+    # Web-search tool enablement.
+    PERM_ENABLE_WEB_SEARCH: int = 1
+    # Multi-city run caps.
+    PERM_MAX_CITIES: int = 0
+    PERM_TOTAL_MAX_VENUES: int = 0
+    PERM_ABSOLUTE_MAX_TOTAL_VENUES: int = 0
+
     RESULT_DIR: str = "./data"
     LOG_DIR: str = "./logs"
     LOG_LEVEL: str = "INFO"

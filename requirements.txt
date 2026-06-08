@@ -1,9 +1,8 @@
-fastapi==0.111.0
-uvicorn[standard]==0.29.0
+fastapi>=0.115,<0.117
+uvicorn[standard]>=0.30
 python-dotenv
 sqlalchemy>=2
 aiosqlite
-fastapi-users[sqlalchemy]==12.*
 pydantic-settings
 celery==5.4.*
 redis==5.0.*
@@ -13,6 +12,10 @@ openpyxl
 scikit-learn
 nltk
 fake-useragent
+beautifulsoup4
+lxml
+requests
+python-multipart>=0.0.27
 
 openai
 python-dateutil
