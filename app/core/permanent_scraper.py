@@ -29,6 +29,9 @@ import asyncio
 import hashlib
 import logging
 import math
+import random
+import re
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -43,7 +46,6 @@ from app.core.temp_scraper import (
     _extract_json_object,
     _extract_response_text,
     _get_openai_client,
-    _lookup_venue_coords_async,
 )
 
 logger = logging.getLogger(__name__)
@@ -449,51 +451,377 @@ async def _lookup_city_center(
     return (lat, lon)
 
 
+_HEAD_UA = "DiventoScraper/1.0 (https://divento.com; contact@divento.com)"
+
+
 def _head_check_image(url: str, *, timeout: float) -> bool:
     """Run in a thread. True if HEAD returns 2xx and Content-Type starts with
-    image/. Falls back to a small GET if HEAD is rejected (some CDNs do 405)."""
+    image/. Falls back to a small GET if HEAD is rejected (some CDNs do 405).
+    Retries once on transient failures (network errors, 429 rate limits)
+    because Wikimedia throttles bursts of concurrent HEADs."""
     if not url:
         return False
-    headers = {"User-Agent": "Mozilla/5.0 (DiventoScraper/permanent)"}
+    headers = {"User-Agent": _HEAD_UA}
+
+    def _attempt() -> bool | None:
+        """Returns True/False on confirmed result, None for retry-worthy fail."""
+        try:
+            r = requests.head(url, timeout=timeout, allow_redirects=True, headers=headers)
+            if r.status_code in (405, 403):
+                # Retry with a tiny GET — some hosts block HEAD.
+                r = requests.get(
+                    url, timeout=timeout, allow_redirects=True, headers=headers, stream=True
+                )
+                r.close()
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                return None  # retryable
+            if r.status_code >= 400:
+                return False
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if ctype and not ctype.startswith("image/"):
+                return False
+            return True
+        except requests.exceptions.RequestException:
+            return None  # network glitch, retry
+
+    first = _attempt()
+    if first is not None:
+        return first
+    time.sleep(0.5 + random.random() * 0.5)
+    second = _attempt()
+    return bool(second)
+
+
+_PERM_PHOTO_CACHE: dict[str, dict[str, str] | None] = {}
+
+_WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
+_WIKIPEDIA_UA = "DiventoScraper/1.0 (https://divento.com; contact@divento.com)"
+
+
+def _venue_name_match_tokens(venue_name: str, *, name_local: str = "") -> set[str]:
+    """Lowercase content tokens for filename matching. We drop city-name
+    tokens (too generic) but keep building-type tokens. Includes any
+    name_local tokens too, since Wikimedia filenames often use the local
+    language ('Palazzo_Pitti', 'Cattedrale_di_Santa_Maria_del_Fiore')."""
+    parts = [venue_name, name_local]
+    text = " ".join(p for p in parts if p)
+    cleaned = re.sub(r"\([^)]*\)", " ", text)
+    tokens = re.findall(r"[A-Za-z]+", cleaned.lower())
+    stop = {
+        "the", "of", "and", "national", "gallery", "museum", "garden", "gardens",
+        # City-name stop tokens: too generic.
+        "florence", "firenze", "florencia", "rome", "roma", "venice", "venezia",
+        "milan", "milano", "naples", "napoli", "paris", "london", "madrid",
+        "barcelona", "lisbon", "brussels", "berlin", "vienna", "wien",
+        "city", "italy", "italia", "france", "spain",
+        # Generic noun tokens that often match wrong files on their own.
+        "saint",
+    }
+    return {t for t in tokens if len(t) >= 4 and t not in stop}
+
+
+def _commons_file_url(filename: str, *, thumb_size: int = 1200, timeout: float = 8.0) -> str | None:
+    """Resolve a 'File:...jpg' title to a working upload.wikimedia.org thumb URL
+    by querying the imageinfo API."""
+    if not filename.lower().startswith("file:"):
+        filename = "File:" + filename
     try:
-        r = requests.head(url, timeout=timeout, allow_redirects=True, headers=headers)
-        if r.status_code == 405 or r.status_code == 403:
-            # Retry with a tiny GET — some hosts block HEAD.
-            r = requests.get(
-                url, timeout=timeout, allow_redirects=True, headers=headers, stream=True
-            )
-            r.close()
-        if r.status_code >= 400:
-            return False
-        ctype = (r.headers.get("Content-Type") or "").lower()
-        if ctype and not ctype.startswith("image/"):
-            return False
-        return True
+        r = requests.get(
+            _WIKIPEDIA_API,
+            params={
+                "action": "query",
+                "titles": filename,
+                "prop": "imageinfo",
+                "iiprop": "url",
+                "iiurlwidth": thumb_size,
+                "format": "json",
+            },
+            headers={"User-Agent": _WIKIPEDIA_UA, "Accept": "application/json"},
+            timeout=timeout,
+        )
+        pages = (r.json().get("query") or {}).get("pages") or {}
+        for p in pages.values():
+            for info in p.get("imageinfo") or []:
+                return info.get("thumburl") or info.get("url")
     except Exception:
-        return False
+        return None
+    return None
 
 
-async def _verify_or_replace_photo(venue: dict[str, Any]) -> dict[str, Any]:
-    """HEAD-verify the photo_url; replace with fallback on failure."""
-    url = venue.get("photo_url") or ""
-    if not _is_likely_image_url(url):
-        if url:
-            logger.debug("perm.photo.reject_shape venue=%s url=%s", venue["name"], url)
-        venue["photo_url"] = settings.PERM_PHOTO_FALLBACK_URL
-        venue["photo_credit"] = ""
-        return venue
+def _wikipedia_lookup_photo(
+    *,
+    venue_name: str,
+    city: str,
+    name_local: str = "",
+    thumb_size: int = 1200,
+    timeout: float = 8.0,
+) -> dict[str, str] | None:
+    """Three-step Wikipedia REST API lookup:
+      1. action=query&list=search to find the page title.
+      2. action=query&prop=pageimages — fast path; accept ONLY if filename
+         contains a venue-name token (avoids generic city-panorama matches
+         when Wikipedia's curated pageimage is bad).
+      3. Fall back to action=query&prop=images and pick the first filename
+         that matches a venue-name token; resolve to a thumb URL via
+         imageinfo. Skips logos/SVGs/icons.
+    Returns dict {image_url, page_url, credit, page_title} or None. Sync;
+    callers should wrap in asyncio.to_thread."""
+    headers = {"User-Agent": _WIKIPEDIA_UA, "Accept": "application/json"}
+    query = f"{venue_name} {city}".strip()
+    try:
+        r = requests.get(
+            _WIKIPEDIA_API,
+            params={
+                "action": "query",
+                "list": "search",
+                "srsearch": query,
+                "format": "json",
+                "srlimit": 1,
+            },
+            headers=headers,
+            timeout=timeout,
+        )
+        hits = (r.json().get("query") or {}).get("search") or []
+        if not hits:
+            return None
+        page_title = hits[0]["title"]
+    except Exception as exc:
+        logger.debug("perm.photo.wikipedia_search_err venue=%s err=%r", venue_name, exc)
+        return None
 
-    if not settings.PERM_PHOTO_VERIFY_ENABLED:
-        return venue
+    page_url = f"https://en.wikipedia.org/wiki/{page_title.replace(' ', '_')}"
+    credit = f"Wikipedia / Wikimedia Commons — {page_title}"
+    name_tokens = _venue_name_match_tokens(venue_name, name_local=name_local)
+
+    # Step 2: pageimages fast path.
+    try:
+        r = requests.get(
+            _WIKIPEDIA_API,
+            params={
+                "action": "query",
+                "titles": page_title,
+                "prop": "pageimages",
+                "pithumbsize": thumb_size,
+                "format": "json",
+            },
+            headers=headers,
+            timeout=timeout,
+        )
+        pages = (r.json().get("query") or {}).get("pages") or {}
+        for p in pages.values():
+            thumb = (p.get("thumbnail") or {}).get("source")
+            page_filename = (p.get("pageimage") or "").lower()
+            if thumb and (not name_tokens or any(t in page_filename for t in name_tokens)):
+                return {
+                    "image_url": thumb,
+                    "page_url": page_url,
+                    "credit": credit,
+                    "page_title": page_title,
+                }
+    except Exception as exc:
+        logger.debug("perm.photo.wikipedia_pageimage_err venue=%s err=%r", venue_name, exc)
+
+    # Step 3: scan all images on the page for a name-match.
+    try:
+        r = requests.get(
+            _WIKIPEDIA_API,
+            params={
+                "action": "query",
+                "titles": page_title,
+                "prop": "images",
+                "imlimit": 30,
+                "format": "json",
+            },
+            headers=headers,
+            timeout=timeout,
+        )
+        pages = (r.json().get("query") or {}).get("pages") or {}
+        for p in pages.values():
+            for im in p.get("images") or []:
+                title = im.get("title") or ""
+                lower = title.lower()
+                # Skip non-photo assets.
+                if lower.endswith((".svg", ".gif")):
+                    continue
+                if any(s in lower for s in ("logo", "commons-logo", "icon", "wikidata", "coa", "flag")):
+                    continue
+                if not name_tokens or not any(t in lower for t in name_tokens):
+                    continue
+                url = _commons_file_url(title, thumb_size=thumb_size, timeout=timeout)
+                if url:
+                    return {
+                        "image_url": url,
+                        "page_url": page_url,
+                        "credit": credit,
+                        "page_title": page_title,
+                    }
+    except Exception as exc:
+        logger.debug("perm.photo.wikipedia_images_err venue=%s err=%r", venue_name, exc)
+    return None
+
+
+async def _lookup_perm_photo(
+    *,
+    client,
+    venue_name: str,
+    name_local: str,
+    city: str,
+    country: str,
+    official_url: str,
+) -> dict[str, str] | None:
+    """Find a working photo for the venue. Strategy:
+      1. Query Wikipedia's REST API (deterministic, ~150ms, never hallucinates).
+      2. HEAD-verify the returned URL.
+      3. If Wikipedia has no page or the URL is dead, fall back to an
+         OpenAI web_search-grounded lookup (only useful for venues with no
+         Wikipedia article, e.g. small museums or recently opened sites).
+    Cached per (venue, city, country)."""
+    cache_key = f"{venue_name.strip().lower()}|{city.strip().lower()}|{country.strip().lower()}"
+    if cache_key in _PERM_PHOTO_CACHE:
+        return _PERM_PHOTO_CACHE[cache_key]
+
+    # Wikipedia-only path. The LLM-based fallback was removed: it consistently
+    # returned plausible but wrong matches (e.g. a generic Florence panorama
+    # for the Accademia Gallery) because gpt-5.2 hallucinates Wikimedia URLs.
+    # If Wikipedia doesn't have a page for a venue, the placeholder is
+    # better than a wrong-venue image in Fiona's Excel.
+    wiki = await asyncio.to_thread(
+        _wikipedia_lookup_photo,
+        venue_name=venue_name,
+        city=city,
+        name_local=name_local,
+    )
+    if not (wiki and wiki.get("image_url")):
+        logger.info("perm.photo.no_wikipedia venue=%s", venue_name)
+        _PERM_PHOTO_CACHE[cache_key] = None
+        return None
 
     ok = await asyncio.to_thread(
-        _head_check_image, url, timeout=settings.PERM_PHOTO_VERIFY_TIMEOUT_S
+        _head_check_image,
+        wiki["image_url"],
+        timeout=settings.PERM_PHOTO_VERIFY_TIMEOUT_S,
     )
     if not ok:
+        logger.info(
+            "perm.photo.wikipedia_dead venue=%s url=%s",
+            venue_name, wiki["image_url"][:80],
+        )
+        _PERM_PHOTO_CACHE[cache_key] = None
+        return None
+
+    out = {
+        "image_url": wiki["image_url"],
+        "page_url": wiki["page_url"],
+        "credit": wiki["credit"],
+    }
+    _PERM_PHOTO_CACHE[cache_key] = out
+    logger.debug("perm.photo.wikipedia venue=%s title=%s", venue_name, wiki["page_title"])
+    return out
+
+
+async def _verify_or_replace_photo(
+    venue: dict[str, Any],
+    *,
+    client,
+    city: str,
+    country: str,
+) -> dict[str, Any]:
+    """HEAD-verify the photo_url from search. If it's bad, do a targeted
+    web_search-grounded lookup for a real Wikimedia/official-site image.
+    Fall through to the placeholder only if both fail."""
+    url = venue.get("photo_url") or ""
+
+    # Step 1: verify search-phase URL if it looks like an image.
+    if url and _is_likely_image_url(url) and settings.PERM_PHOTO_VERIFY_ENABLED:
+        ok = await asyncio.to_thread(
+            _head_check_image, url, timeout=settings.PERM_PHOTO_VERIFY_TIMEOUT_S
+        )
+        if ok:
+            return venue
         logger.info("perm.photo.dead venue=%s url=%s", venue["name"], url)
-        venue["photo_url"] = settings.PERM_PHOTO_FALLBACK_URL
-        venue["photo_credit"] = ""
+
+    # Step 2: targeted lookup.
+    found = await _lookup_perm_photo(
+        client=client,
+        venue_name=venue["name"],
+        name_local=venue.get("name_local", "") or "",
+        city=city,
+        country=country,
+        official_url=venue.get("official_url", ""),
+    )
+    if found is not None:
+        venue["photo_url"] = found["image_url"]
+        if found["credit"]:
+            venue["photo_credit"] = found["credit"]
+        logger.info(
+            "perm.photo.replaced venue=%s -> %s", venue["name"], found["image_url"][:80]
+        )
+        return venue
+
+    # Step 3: fallback to placeholder.
+    venue["photo_url"] = settings.PERM_PHOTO_FALLBACK_URL
+    venue["photo_credit"] = ""
     return venue
+
+
+_PERM_COORD_CACHE: dict[str, tuple[float, float] | None] = {}
+
+
+async def _lookup_perm_coords(
+    *,
+    client,
+    venue_name: str,
+    address: str,
+    city: str,
+    country: str,
+) -> tuple[float, float] | None:
+    """Permanent-attraction coord lookup. These are well-documented landmarks
+    on Wikipedia, Google Maps, tourism sites — the model should find real
+    coords for nearly every one. Cached per (name+city+country)."""
+    cache_key = f"{venue_name.strip().lower()}|{city.strip().lower()}|{country.strip().lower()}"
+    if cache_key in _PERM_COORD_CACHE:
+        return _PERM_COORD_CACHE[cache_key]
+
+    tools = [{"type": "web_search"}] if settings.PERM_ENABLE_WEB_SEARCH else None
+    prompt = (
+        f"What are the geographic coordinates of {venue_name} in {city}, {country}?\n"
+        f"Address: {address}\n\n"
+        "This is a famous permanent attraction. Its coordinates are documented "
+        "on Wikipedia (look for the infobox), on Google Maps, and on official "
+        "tourism sites. Search the web if needed.\n\n"
+        'Return ONLY JSON: {"latitude": <decimal>, "longitude": <decimal>}.\n'
+        "Use decimal degrees (e.g. 43.7678, 11.2553). Both fields must be numbers.\n"
+        'If you genuinely cannot find them after a focused search, return {"latitude": null, "longitude": null}.\n'
+        "Do NOT invent coordinates. Do NOT return city-center coordinates as a fallback."
+    )
+    try:
+        resp = await _call_with_backoff(
+            lambda: client.responses.create(
+                model=PERM_SEARCH_MODEL,
+                input=prompt,
+                tools=tools,
+                max_output_tokens=1200,
+            ),
+            max_attempts=3,
+        )
+    except Exception as exc:
+        logger.warning("perm.coord.lookup_error venue=%s err=%r", venue_name, exc)
+        _PERM_COORD_CACHE[cache_key] = None
+        return None
+
+    raw = resp.output_text or _extract_response_text(resp) or ""
+    obj = _extract_json_object(_clean_json_content(raw))
+    if not isinstance(obj, dict):
+        logger.warning("perm.coord.lookup_parse_failed venue=%s head=%r", venue_name, raw[:200])
+        _PERM_COORD_CACHE[cache_key] = None
+        return None
+    lat = _coerce_float(obj.get("latitude"))
+    lon = _coerce_float(obj.get("longitude"))
+    if lat is None or lon is None:
+        _PERM_COORD_CACHE[cache_key] = None
+        return None
+    _PERM_COORD_CACHE[cache_key] = (lat, lon)
+    return (lat, lon)
 
 
 async def _backfill_coords(
@@ -503,30 +831,25 @@ async def _backfill_coords(
     city: str,
     country: str,
 ) -> dict[str, Any]:
-    """If lat/lon is missing, call _lookup_venue_coords_async (reuses temp's
-    cache). Mutates and returns the venue dict."""
+    """If lat/lon is missing, call _lookup_perm_coords. Mutates and returns
+    the venue dict."""
     if venue.get("latitude") is not None and venue.get("longitude") is not None:
         return venue
-    use_web = bool(settings.PERM_ENABLE_WEB_SEARCH)
-    coords = await _lookup_venue_coords_async(
+    coords = await _lookup_perm_coords(
         client=client,
-        venue=venue["name"],
+        venue_name=venue["name"],
         address=venue.get("address", ""),
         city=city,
         country=country,
-        use_web_search_tool=use_web,
     )
     if coords is None:
+        logger.info("perm.coord.unfilled venue=%s", venue["name"])
         return venue
-    lat_s, lon_s, _src = coords
-    lat = _coerce_float(lat_s)
-    lon = _coerce_float(lon_s)
-    if lat is not None and lon is not None:
-        venue["latitude"] = lat
-        venue["longitude"] = lon
-        logger.debug(
-            "perm.coord.backfill venue=%s lat=%s lon=%s", venue["name"], lat, lon
-        )
+    venue["latitude"], venue["longitude"] = coords
+    logger.debug(
+        "perm.coord.backfill venue=%s lat=%s lon=%s",
+        venue["name"], coords[0], coords[1],
+    )
     return venue
 
 
@@ -591,7 +914,9 @@ async def _enrich_one_venue(
         return None
 
     async with photo_sem:
-        venue = await _verify_or_replace_photo(venue)
+        venue = await _verify_or_replace_photo(
+            venue, client=client, city=city, country=country
+        )
 
     venue = _backfill_hours_duration(venue)
     return venue
