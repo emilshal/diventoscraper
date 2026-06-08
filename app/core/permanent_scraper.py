@@ -656,8 +656,141 @@ async def enrich_venues(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Phase 3-4 — copy + translate (stub — implemented in sub-checkpoint 2c)
+# Phase 3 — English copy generation
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+# Same category set the old Google-based scraper used; Filament UI / DB may
+# depend on these exact strings.
+DIVENTO_CATEGORIES = [
+    "Whats_hot",
+    "Performing_Arts",
+    "Famous_Places",
+    "Eating_and_Drinking",
+    "Arts_and_Culture",
+    "Hidden_Gems",
+    "Family",
+    "Parks_and_Gardens",
+    "Historic_Houses_and_Sites",
+]
+
+
+_PERM_COPY_SYSTEM = (
+    "You are an expert travel writer and historian specialising in cultural "
+    "attractions. You write factual, historically accurate descriptions based "
+    "on thorough research. Respond only with JSON matching the provided schema."
+)
+
+
+def _build_copy_prompt(
+    *,
+    venue: dict[str, Any],
+    city: str,
+    country: str,
+) -> str:
+    name = venue.get("name", "")
+    name_local = venue.get("name_local", "")
+    address = venue.get("address", "")
+    official = venue.get("official_url", "")
+    cats_seed = ", ".join(venue.get("categories") or [])
+    return (
+        f"Write copy for a Divento permanent attraction or museum listing.\n\n"
+        f"INPUTS\n"
+        f"- Name: {name}\n"
+        f"- Local-language name (if different): {name_local}\n"
+        f"- City: {city}\n"
+        f"- Country: {country}\n"
+        f"- Address: {address}\n"
+        f"- Official URL (use only as a fact-check reference, do not cite): {official}\n"
+        f"- Search-phase category seeds (use to inform 'categories', refine if needed): {cats_seed}\n\n"
+        f"AVAILABLE CATEGORIES (pick 1-3 most relevant, comma-separated):\n"
+        f"{', '.join(DIVENTO_CATEGORIES)}\n\n"
+        "GLOBAL PRIORITY\n"
+        f"- Base all content on verified factual sources, prioritising the official website of {name} where possible.\n"
+        "- Extract concrete information (history, architecture, collections, artworks, people) from official sources.\n"
+        "- Rewrite all information in Divento style; do not copy text verbatim.\n"
+        "- Do not invent dates, artworks, artists, or historical context.\n\n"
+        "WRITING STYLE GUIDELINES\n"
+        "- Use an informal tone and address the reader directly as 'you'.\n"
+        "- Write as though the author has visited the attraction.\n"
+        "- Base descriptions heavily on historical fact, including dates, architectural styles, origins and development, physical and spatial detail.\n"
+        "- Include people associated with the site (architects, artists, patrons, historical figures), with dates where relevant.\n"
+        "- When describing museums, include specific artworks or objects, not general summaries.\n"
+        "- Integrate naturally: one highlight, two don't-miss elements, and one lesser-known detail.\n"
+        "- Be specific and concrete; use precise nouns and strong verbs.\n"
+        "- Cut filler and favour active voice.\n"
+        "- Always use British English spelling.\n\n"
+        "DATE RULES (STRICT)\n"
+        "- Include dates where they add clarity: construction and modification phases, historical events linked to the site, creation dates of artworks where relevant.\n"
+        "- For people: format as Name (birth-death) or Name (born YEAR), and include only on first mention.\n"
+        "- Do not overload with unnecessary dates.\n"
+        "- Never guess or approximate.\n\n"
+        "STRICTLY FORBIDDEN WORDS\n"
+        "Never use: visitor(s), located, feature(d), showcase, blend, period, accessible, house(d), home(d), step into.\n"
+        "Avoid all brochure-style language.\n\n"
+        "FORMAT REQUIREMENTS\n"
+        "- Spell out numbers from one to ten; use numerals from 11 upward.\n"
+        "- Ensure consistent spacing.\n"
+        "- Do not begin descriptions with the attraction name.\n"
+        "- Do not start with: include, explore, step into.\n"
+        "- Avoid wrap-up sentences and dashes.\n"
+        "- Use active voice.\n"
+        "- Do not use em/en dash characters (— or –); rewrite with commas or parentheses.\n\n"
+        "HTML\n"
+        "- Wrap each paragraph in <p></p> tags in 'long_en'.\n"
+        "- Keep formatting clean and minimal.\n\n"
+        "LONG DESCRIPTION (long_en)\n"
+        "- Target 300-320 words.\n"
+        "- Multiple paragraphs.\n"
+        "- Must read as a continuous narrative, not a checklist.\n"
+        "- Avoid formulaic openings.\n\n"
+        "SHORT DESCRIPTION (short_en)\n"
+        "- Maximum 164 characters.\n"
+        "- One sentence only.\n"
+        "- Aim for 20-25 words where possible.\n"
+        "- Include a clear subject, a specific reason to visit, and at least one concrete detail.\n"
+        "- Do not repeat the attraction name.\n"
+        "- Do not be vague or promotional.\n\n"
+        "META DESCRIPTION (meta_en)\n"
+        "- Maximum 150 characters.\n"
+        "- One sentence, SEO-style: name the attraction + the single most distinctive reason to visit.\n"
+        "- Plain text only (no HTML).\n\n"
+        "OUTPUT\n"
+        "Return ONLY a JSON object with these keys:\n"
+        "{\n"
+        '  "short_en": "...",\n'
+        '  "long_en":  "<p>...</p><p>...</p>",\n'
+        '  "meta_en":  "...",\n'
+        '  "categories": "Comma_Separated, From_Available_List"\n'
+        "}"
+    )
+
+
+_PERM_COPY_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "short_en": {"type": "string"},
+        "long_en": {"type": "string"},
+        "meta_en": {"type": "string"},
+        "categories": {"type": "string"},
+    },
+    "required": ["short_en", "long_en", "meta_en", "categories"],
+}
+
+
+def _normalise_categories(value: str) -> str:
+    """Filter the model's categories to the allowed list, comma-joined."""
+    if not value:
+        return ""
+    raw = [c.strip() for c in value.split(",") if c.strip()]
+    allowed_lower = {c.lower(): c for c in DIVENTO_CATEGORIES}
+    out: list[str] = []
+    for c in raw:
+        match = allowed_lower.get(c.lower())
+        if match and match not in out:
+            out.append(match)
+    return ", ".join(out)
 
 
 async def generate_copy(
@@ -667,39 +800,351 @@ async def generate_copy(
     city: str,
     country: str,
 ) -> dict[str, str]:
-    """English short_en / long_en / meta_en. Implemented in 2c."""
-    raise NotImplementedError("generate_copy — implemented in sub-checkpoint 2c")
+    """English short_en / long_en / meta_en + filtered Divento categories.
+    Returns {} on terminal failure — caller decides whether to drop the venue."""
+    prompt = _build_copy_prompt(venue=venue, city=city, country=country)
+    try:
+        resp = await _call_with_backoff(
+            lambda: client.responses.create(
+                model=PERM_COPY_MODEL,
+                input=[
+                    {"role": "system", "content": _PERM_COPY_SYSTEM},
+                    {"role": "user", "content": prompt},
+                ],
+                text={
+                    "verbosity": "low",
+                    "format": {
+                        "type": "json_schema",
+                        "name": "perm_venue_copy",
+                        "strict": True,
+                        "schema": _PERM_COPY_SCHEMA,
+                    },
+                },
+                max_output_tokens=3500,
+            ),
+            max_attempts=3,
+        )
+    except Exception as exc:
+        # Fall back to json_object on schema rejection by the model.
+        logger.warning("perm.copy.schema_failed venue=%s err=%r", venue.get("name"), exc)
+        try:
+            resp = await _call_with_backoff(
+                lambda: client.responses.create(
+                    model=PERM_COPY_MODEL,
+                    input=[
+                        {"role": "system", "content": _PERM_COPY_SYSTEM},
+                        {"role": "user", "content": prompt},
+                    ],
+                    text={"verbosity": "low", "format": {"type": "json_object"}},
+                    max_output_tokens=3500,
+                ),
+                max_attempts=2,
+            )
+        except Exception as exc2:
+            logger.error("perm.copy.error venue=%s err=%r", venue.get("name"), exc2)
+            return {}
+
+    raw = resp.output_text or _extract_response_text(resp) or ""
+    obj = _extract_json_object(_clean_json_content(raw))
+    if not isinstance(obj, dict):
+        logger.warning(
+            "perm.copy.parse_failed venue=%s head=%r", venue.get("name"), raw[:200]
+        )
+        return {}
+
+    return {
+        "short_en": _coerce_str(obj.get("short_en")),
+        "long_en": _coerce_str(obj.get("long_en")),
+        "meta_en": _coerce_str(obj.get("meta_en")),
+        "categories": _normalise_categories(_coerce_str(obj.get("categories"))),
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Phase 4 — translate
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+_PERM_TRANSLATE_SYSTEM = (
+    "You are a professional translator specialising in travel content. "
+    "You translate faithfully, preserve historical and factual accuracy, "
+    "keep HTML tags intact, and respond only with JSON matching the provided schema."
+)
+
+
+def _build_translate_prompt(
+    *,
+    name: str,
+    city: str,
+    short_en: str,
+    long_en: str,
+    meta_en: str,
+) -> str:
+    return (
+        f'Translate these travel descriptions for "{name}" in {city} from English '
+        "to French, Spanish, Italian, Russian, and Chinese (Simplified).\n\n"
+        "Also translate the city name itself for each target language (e.g. "
+        "Florence -> Florence/Florencia/Firenze/Флоренция/佛罗伦萨). If the city "
+        "name does not have an established local translation, return it unchanged.\n\n"
+        f"SHORT DESCRIPTION (English):\n{short_en}\n\n"
+        f"LONG DESCRIPTION (English, HTML):\n{long_en}\n\n"
+        f"META DESCRIPTION (English):\n{meta_en}\n\n"
+        "Requirements:\n"
+        "- Maintain the same HTML formatting in long descriptions.\n"
+        "- Keep the same tone and informal style; address the reader directly where the source does.\n"
+        "- Preserve historical accuracy and factual information; do not invent details.\n"
+        "- Maintain British English spelling conventions in the source meaning.\n"
+        "- Do not use em/en dash characters (— or –); rewrite with commas or parentheses.\n"
+        "- For Chinese (zh), translate ALL prose into Simplified Chinese; Latin script is allowed ONLY for proper nouns and official artwork/series titles.\n\n"
+        "Return ONLY a JSON object with this exact structure:\n"
+        "{\n"
+        '  "fr": {"short": "...", "long": "...", "meta": "...", "city": "..."},\n'
+        '  "es": {"short": "...", "long": "...", "meta": "...", "city": "..."},\n'
+        '  "it": {"short": "...", "long": "...", "meta": "...", "city": "..."},\n'
+        '  "ru": {"short": "...", "long": "...", "meta": "...", "city": "..."},\n'
+        '  "zh": {"short": "...", "long": "...", "meta": "...", "city": "..."}\n'
+        "}"
+    )
+
+
+def _build_translate_schema(languages: list[str]) -> dict[str, Any]:
+    lang_obj = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "short": {"type": "string"},
+            "long": {"type": "string"},
+            "meta": {"type": "string"},
+            "city": {"type": "string"},
+        },
+        "required": ["short", "long", "meta", "city"],
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {lang: lang_obj for lang in languages},
+        "required": languages,
+    }
+
+
+def _empty_translation_bundle() -> dict[str, dict[str, str]]:
+    return {
+        lang: {"short": "", "long": "", "meta": "", "city": ""}
+        for lang in PERMANENT_LANGUAGES
+    }
 
 
 async def translate_venue(
     *,
     client,
-    english: dict[str, str],
+    name: str,
     city: str,
+    english: dict[str, str],
 ) -> dict[str, dict[str, str]]:
-    """fr/es/it/ru/zh bundle for short/long/meta + city name. Implemented in 2c."""
-    raise NotImplementedError("translate_venue — implemented in sub-checkpoint 2c")
+    """Translate short/long/meta + city name into PERMANENT_LANGUAGES.
+    Returns {lang: {short, long, meta, city}}; empties on failure."""
+    short_en = english.get("short_en", "")
+    long_en = english.get("long_en", "")
+    meta_en = english.get("meta_en", "")
+    if not any([short_en, long_en, meta_en]):
+        return _empty_translation_bundle()
+
+    prompt = _build_translate_prompt(
+        name=name,
+        city=city,
+        short_en=short_en,
+        long_en=long_en,
+        meta_en=meta_en,
+    )
+    schema = _build_translate_schema(PERMANENT_LANGUAGES)
+
+    async def _attempt(model: str) -> dict[str, Any] | None:
+        try:
+            resp = await _call_with_backoff(
+                lambda: client.responses.create(
+                    model=model,
+                    input=[
+                        {"role": "system", "content": _PERM_TRANSLATE_SYSTEM},
+                        {"role": "user", "content": prompt},
+                    ],
+                    text={
+                        "verbosity": "low",
+                        "format": {
+                            "type": "json_schema",
+                            "name": "perm_translation_bundle",
+                            "strict": True,
+                            "schema": schema,
+                        },
+                    },
+                    max_output_tokens=9000,
+                ),
+                max_attempts=3,
+            )
+        except Exception as exc:
+            logger.warning("perm.translate.schema_failed model=%s err=%r", model, exc)
+            return None
+        raw = resp.output_text or _extract_response_text(resp) or ""
+        obj = _extract_json_object(_clean_json_content(raw))
+        return obj if isinstance(obj, dict) else None
+
+    data = await _attempt(PERM_TRANSLATION_MODEL)
+    if data is None and PERM_TRANSLATION_FALLBACK_MODEL != PERM_TRANSLATION_MODEL:
+        logger.info("perm.translate.fallback name=%s", name)
+        data = await _attempt(PERM_TRANSLATION_FALLBACK_MODEL)
+
+    if data is None:
+        logger.error("perm.translate.error name=%s — both models failed", name)
+        return _empty_translation_bundle()
+
+    out: dict[str, dict[str, str]] = {}
+    for lang in PERMANENT_LANGUAGES:
+        obj = data.get(lang) if isinstance(data.get(lang), dict) else {}
+        out[lang] = {
+            "short": _coerce_str((obj or {}).get("short")),
+            "long": _coerce_str((obj or {}).get("long")),
+            "meta": _coerce_str((obj or {}).get("meta")),
+            "city": _coerce_str((obj or {}).get("city")),
+        }
+    return out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Top-level orchestrator (stub — implemented after 2b + 2c)
+# Top-level orchestrator
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+async def _copy_and_translate_one(
+    *,
+    client,
+    venue: dict[str, Any],
+    city: str,
+    country: str,
+    copy_sem: asyncio.Semaphore,
+    translate_sem: asyncio.Semaphore,
+    run_store: RunStore | None,
+    run_id: str | None,
+) -> dict[str, Any] | None:
+    try:
+        async with copy_sem:
+            english = await generate_copy(
+                client=client, venue=venue, city=city, country=country
+            )
+        if not english:
+            logger.warning("perm.copy.empty venue=%s — dropping", venue.get("name"))
+            return None
+        if run_store is not None and run_id is not None:
+            await run_store.mark_venue_copy(run_id, venue["venue_id"], english)
+
+        async with translate_sem:
+            translations = await translate_venue(
+                client=client, name=venue["name"], city=city, english=english
+            )
+        if run_store is not None and run_id is not None:
+            await run_store.mark_venue_translated(run_id, venue["venue_id"], translations)
+
+        # Attach copy + translations to the venue dict for the Excel writer.
+        venue["copy"] = english
+        venue["translations"] = translations
+        return venue
+    except Exception as exc:
+        logger.exception(
+            "perm.copy_translate.error venue=%s err=%r", venue.get("name"), exc
+        )
+        return None
 
 
 async def run_permanent_scrape(
     *,
     run_id: str,
     cities: list[str],
+    country: str,
     min_reviews: int,
     target_min: int,
     target_max: int,
     run_store: RunStore,
 ) -> dict[str, Any]:
-    """Top-level entry point — search → enrich → copy → translate → write.
+    """Top-level entry point — search → enrich → copy → translate.
 
-    Stub until 2b + 2c land. The search phase is callable directly via
-    `search_city()` for prompt testing in the meantime.
+    The Excel writer is owned by the API layer (`app/ui.py`) because it
+    needs to choose the output path; this function returns the fully
+    enriched venue dicts and a per-city summary.
     """
-    raise NotImplementedError(
-        "run_permanent_scrape — full orchestrator implemented after sub-checkpoints 2b + 2c"
+    client = _get_openai_client()
+    if client is None:
+        await run_store.update_run(
+            run_id, status="error", error_message="OPENAI_API_KEY not configured"
+        )
+        raise RuntimeError("OPENAI_API_KEY not configured")
+
+    summary: dict[str, int] = {}
+    all_venues: list[dict[str, Any]] = []
+
+    copy_sem = asyncio.Semaphore(max(1, settings.PERM_COPY_CONCURRENCY))
+    translate_sem = asyncio.Semaphore(max(1, settings.PERM_TRANSLATION_CONCURRENCY))
+
+    for i, city in enumerate(cities):
+        await run_store.update_run(
+            run_id,
+            status="searching",
+            current_phase="search",
+            current_city=city,
+            progress_pct=round(i / max(1, len(cities)) * 100, 1),
+        )
+        searched = await search_city(
+            client=client,
+            city=city,
+            country=country,
+            min_reviews=min_reviews,
+            target_min=target_min,
+            target_max=target_max,
+            run_store=run_store,
+            run_id=run_id,
+        )
+
+        await run_store.update_run(run_id, status="enriching", current_phase="enrich")
+        enriched = await enrich_venues(
+            client=client,
+            city=city,
+            country=country,
+            venues=searched,
+            run_store=run_store,
+            run_id=run_id,
+        )
+
+        await run_store.update_run(
+            run_id, status="translating", current_phase="copy+translate"
+        )
+        tasks = [
+            _copy_and_translate_one(
+                client=client,
+                venue=v,
+                city=city,
+                country=country,
+                copy_sem=copy_sem,
+                translate_sem=translate_sem,
+                run_store=run_store,
+                run_id=run_id,
+            )
+            for v in enriched
+        ]
+        results = await asyncio.gather(*tasks)
+        kept = [r for r in results if r is not None]
+        summary[city] = len(kept)
+        all_venues.extend(kept)
+        logger.info(
+            "perm.city_done city=%s searched=%d enriched=%d final=%d",
+            city,
+            len(searched),
+            len(enriched),
+            len(kept),
+        )
+
+    await run_store.update_run(
+        run_id,
+        status="writing",
+        current_phase="excel",
+        current_city=None,
+        progress_pct=95.0,
+        result_summary=summary,
     )
+    return {"venues": all_venues, "summary": summary}
