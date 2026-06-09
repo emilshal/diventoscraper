@@ -574,9 +574,11 @@ async def _lookup_country_wiki_lang(*, client, country: str) -> str:
     try:
         resp = await _call_with_backoff(
             lambda: client.responses.create(
-                model=PERM_COPY_MODEL,
+                # PERM_MODEL, not the copy model: gpt-5's reasoning would
+                # consume this tiny 600-token budget and return empty.
+                model=PERM_MODEL,
                 input=prompt,
-                max_output_tokens=200,
+                max_output_tokens=600,
             ),
             max_attempts=2,
         )
@@ -1915,10 +1917,14 @@ async def _assign_city_editorial_ratings_perm_async(
     max_tokens = max(2500, min(8000, 1500 + len(venues) * 40))
 
     content = ""
+    # Rating is OUR feature (the original Excel's rating came from Google
+    # Places, not a prompt) — so it stays on PERM_MODEL (gpt-5.2), where
+    # the tier output was validated. The restored gpt-5 copy model burns the
+    # whole output budget on reasoning and returns empty here.
     try:
         resp = await _call_with_backoff(
             lambda: client.responses.create(
-                model=PERM_COPY_MODEL,
+                model=PERM_MODEL,
                 input=prompt,
                 reasoning={"effort": "medium"},
                 text={
@@ -1939,7 +1945,7 @@ async def _assign_city_editorial_ratings_perm_async(
         try:
             resp = await _call_with_backoff(
                 lambda: client.responses.create(
-                    model=PERM_COPY_MODEL,
+                    model=PERM_MODEL,
                     input=prompt,
                     reasoning={"effort": "medium"},
                     text={"verbosity": "low", "format": {"type": "json_object"}},
