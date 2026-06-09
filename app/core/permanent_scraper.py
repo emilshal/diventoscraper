@@ -1216,10 +1216,107 @@ DIVENTO_CATEGORIES = [
 ]
 
 
+# System message restored VERBATIM from the original scrape_destinations.py
+# (the Google-Places-era script). Fiona asked for identical copy behaviour.
 _PERM_COPY_SYSTEM = (
-    "You are an expert travel writer and historian specialising in cultural "
-    "attractions. You write factual, historically accurate descriptions based "
-    "on thorough research. Respond only with JSON matching the provided schema."
+    "You are an expert travel writer and historian specialising in cultural attractions. "
+    "You have extensive firsthand knowledge of historical sites, architecture, and art. "
+    "You write factual, historically accurate descriptions based on thorough research. "
+    "Follow the provided examples and guidelines exactly. Respond only with JSON."
+)
+
+# DESC_PROMPT restored VERBATIM from the original scrape_destinations.py
+# lines 142-231. Do not edit without checking with the client — she asked
+# for the exact pre-rebuild prompt.
+_OLD_DESC_PROMPT = (
+    "Write copy for a Divento permanent attraction or museum listing.\n\n"
+    "GLOBAL PRIORITY\n"
+    "- Base all content on verified factual sources, prioritising the official website of the venue where possible.\n"
+    "- Extract concrete information (history, architecture, collections, artworks, people) from official sources.\n"
+    "- Rewrite all information in Divento style; do not copy text verbatim.\n"
+    "- Do not invent dates, artworks, artists, or historical context.\n\n"
+    "WRITING STYLE GUIDELINES\n"
+    "- Use an informal tone and address the reader directly as 'you'.\n"
+    "- Write as though the author has visited the attraction.\n"
+    "- Base descriptions heavily on historical fact, including dates, architectural styles, origins and development, physical and spatial detail.\n"
+    "- Include people associated with the site (architects, artists, patrons, historical figures), with dates where relevant.\n"
+    "- When describing museums, include specific artworks or objects, not general summaries.\n"
+    "- Integrate naturally: one highlight, two don't-miss elements, and one lesser-known detail.\n"
+    "- Be specific and concrete; use precise nouns and strong verbs.\n"
+    "- Cut filler and favour active voice.\n"
+    "- Always use British English spelling.\n\n"
+    "DATE RULES (STRICT)\n"
+    "- Include dates where they add clarity: construction and modification phases, historical events linked to the site, creation dates of artworks where relevant.\n"
+    "- For people: format as Name (birth-death) or Name (born YEAR), and include only on first mention.\n"
+    "- Do not overload with unnecessary dates.\n"
+    "- Never guess or approximate.\n\n"
+    "STRICTLY FORBIDDEN WORDS\n"
+    "Never use: visitor(s), located, feature(d), showcase, blend, period, accessible, house(d), home(d), step into\n"
+    "Avoid all brochure-style language.\n\n"
+    "FORMAT REQUIREMENTS\n"
+    "- Spell out numbers from one to ten; use numerals from 11 upward.\n"
+    "- Ensure consistent spacing.\n"
+    "- Do not begin descriptions with the attraction name.\n"
+    "- Do not start with: include, explore, step into.\n"
+    "- Avoid wrap-up sentences and dashes.\n"
+    "- Use active voice.\n\n"
+    "HTML\n"
+    "- Wrap each paragraph in <p></p> tags.\n"
+    "- Keep formatting clean and minimal.\n\n"
+    "LONG DESCRIPTION\n"
+    "- Target 300-320 words.\n"
+    "- Multiple paragraphs.\n"
+    "- Must read as a continuous narrative, not a checklist.\n"
+    "- Avoid formulaic openings.\n\n"
+    "CONTENT REQUIREMENTS\n"
+    "- Include architectural and structural detail, materials and construction techniques, and changes over time.\n"
+    "- Clearly explain original function vs current use.\n"
+    "- Include political, cultural, or historical context and notable events tied to the site.\n"
+    "- Mention specific artworks, artefacts, or architectural elements.\n"
+    "- Integrate highlight, don't-miss, and lesser-known details naturally.\n\n"
+    "SOURCE DISCIPLINE (CRITICAL)\n"
+    "- Anchor the text in verifiable facts drawn from the venue's official description.\n"
+    "- Prefer named works, artists, materials, dates, and features explicitly mentioned by the venue.\n"
+    "- If detailed information is limited, remain factual and restrained rather than expanding into generic filler.\n"
+    "- Do not add speculative interpretation.\n\n"
+    "SHORT DESCRIPTION\n"
+    "- Maximum 164 characters.\n"
+    "- One sentence only.\n"
+    "- Aim for 20-25 words where possible.\n\n"
+    "Must:\n"
+    "- Include a clear subject (building, site, collection, or theme).\n"
+    "- Include a specific reason to visit.\n"
+    "- Include at least one concrete detail (date, feature, artwork, or historical fact).\n"
+    "- Contain a verb.\n"
+    "- Read naturally.\n\n"
+    "Must NOT:\n"
+    "- Repeat the attraction name.\n"
+    "- Be vague or promotional.\n"
+    "- Focus on layout, rooms, or visitor flow.\n\n"
+    "SHORT DESCRIPTION CONTENT RULES\n"
+    "- Historic building/site -> include construction date or era.\n"
+    "- Museum -> include type of collection and key strength.\n"
+    "- Person-focused site -> include name and dates.\n"
+    "- Cultural/historical theme -> include timeframe.\n"
+    "- If multiple angles exist, prioritise the most distinctive one.\n\n"
+    "KEY HISTORICAL ELEMENTS TO INCLUDE\n"
+    "- Construction dates and phases.\n"
+    "- Architectural styles and materials.\n"
+    "- Dimensions and technical details where relevant.\n"
+    "- Architects, artists, patrons (with dates where relevant).\n"
+    "- Political and social context.\n"
+    "- Specific artworks, sculptures, decorative elements.\n"
+    "- Original vs current function.\n"
+    "- Construction and engineering techniques.\n"
+    "- Events that took place there.\n"
+    "- Archaeological discoveries and findings.\n\n"
+    "OUTPUT\n"
+    "Return ONLY a JSON object:\n"
+    "{\n"
+    '  "short": "...",\n'
+    '  "long": "..."\n'
+    "}\n\n"
+    "Both fields must be non-empty strings."
 )
 
 
@@ -1229,81 +1326,23 @@ def _build_copy_prompt(
     city: str,
     country: str,
 ) -> str:
+    """User prompt restored to the original enrich_place_sync() structure.
+    The old `context` was Google Places' editorial_summary (or first review)
+    — that source is gone, so context is empty, a state the original code
+    also produced when Google had no summary."""
     name = venue.get("name", "")
-    name_local = venue.get("name_local", "")
-    address = venue.get("address", "")
-    official = venue.get("official_url", "")
-    cats_seed = ", ".join(venue.get("categories") or [])
+    context = ""
     return (
-        f"Write copy for a Divento permanent attraction or museum listing.\n\n"
-        f"INPUTS\n"
-        f"- Name: {name}\n"
-        f"- Local-language name (if different): {name_local}\n"
-        f"- City: {city}\n"
-        f"- Country: {country}\n"
-        f"- Address: {address}\n"
-        f"- Official URL (use only as a fact-check reference, do not cite): {official}\n"
-        f"- Search-phase category seeds (use to inform 'categories', refine if needed): {cats_seed}\n\n"
-        f"AVAILABLE CATEGORIES (pick 1-3 most relevant, comma-separated):\n"
-        f"{', '.join(DIVENTO_CATEGORIES)}\n\n"
-        "GLOBAL PRIORITY\n"
-        f"- Base all content on verified factual sources, prioritising the official website of {name} where possible.\n"
-        "- Extract concrete information (history, architecture, collections, artworks, people) from official sources.\n"
-        "- Rewrite all information in Divento style; do not copy text verbatim.\n"
-        "- Do not invent dates, artworks, artists, or historical context.\n\n"
-        "WRITING STYLE GUIDELINES\n"
-        "- Use an informal tone and address the reader directly as 'you'.\n"
-        "- Write as though the author has visited the attraction.\n"
-        "- Base descriptions heavily on historical fact, including dates, architectural styles, origins and development, physical and spatial detail.\n"
-        "- Include people associated with the site (architects, artists, patrons, historical figures), with dates where relevant.\n"
-        "- When describing museums, include specific artworks or objects, not general summaries.\n"
-        "- Integrate naturally: one highlight, two don't-miss elements, and one lesser-known detail.\n"
-        "- Be specific and concrete; use precise nouns and strong verbs.\n"
-        "- Cut filler and favour active voice.\n"
-        "- Always use British English spelling.\n\n"
-        "DATE RULES (STRICT)\n"
-        "- Include dates where they add clarity: construction and modification phases, historical events linked to the site, creation dates of artworks where relevant.\n"
-        "- For people: format as Name (birth-death) or Name (born YEAR), and include only on first mention.\n"
-        "- Do not overload with unnecessary dates.\n"
-        "- Never guess or approximate.\n\n"
-        "STRICTLY FORBIDDEN WORDS\n"
-        "Never use: visitor(s), located, feature(d), showcase, blend, period, accessible, house(d), home(d), step into.\n"
-        "Avoid all brochure-style language.\n\n"
-        "FORMAT REQUIREMENTS\n"
-        "- Spell out numbers from one to ten; use numerals from 11 upward.\n"
-        "- Ensure consistent spacing.\n"
-        "- Do not begin descriptions with the attraction name.\n"
-        "- Do not start with: include, explore, step into.\n"
-        "- Avoid wrap-up sentences and dashes.\n"
-        "- Use active voice.\n"
-        "- Do not use em/en dash characters (— or –); rewrite with commas or parentheses.\n\n"
-        "HTML\n"
-        "- Wrap each paragraph in <p></p> tags in 'long_en'.\n"
-        "- Keep formatting clean and minimal.\n\n"
-        "LONG DESCRIPTION (long_en)\n"
-        "- Target 300-320 words.\n"
-        "- Multiple paragraphs.\n"
-        "- Must read as a continuous narrative, not a checklist.\n"
-        "- Avoid formulaic openings.\n\n"
-        "SHORT DESCRIPTION (short_en)\n"
-        "- Maximum 164 characters.\n"
-        "- One sentence only.\n"
-        "- Aim for 20-25 words where possible.\n"
-        "- Include a clear subject, a specific reason to visit, and at least one concrete detail.\n"
-        "- Do not repeat the attraction name.\n"
-        "- Do not be vague or promotional.\n\n"
-        "META DESCRIPTION (meta_en)\n"
-        "- Maximum 150 characters.\n"
-        "- One sentence, SEO-style: name the attraction + the single most distinctive reason to visit.\n"
-        "- Plain text only (no HTML).\n\n"
-        "OUTPUT\n"
-        "Return ONLY a JSON object with these keys:\n"
-        "{\n"
-        '  "short_en": "...",\n'
-        '  "long_en":  "<p>...</p><p>...</p>",\n'
-        '  "meta_en":  "...",\n'
-        '  "categories": "Comma_Separated, From_Available_List"\n'
-        "}"
+        f"Write historically accurate copy for: {name} in {city}.\n"
+        f"Context: {context}\n\n"
+        f"Available categories: {', '.join(DIVENTO_CATEGORIES)}\n"
+        "If multiple categories apply, include all relevant categories as a single comma-separated string under the 'categories' key.\n\n"
+        f"{_OLD_DESC_PROMPT}\n\n"
+        "Write descriptions ONLY IN ENGLISH following the source discipline and historical accuracy requirements above. "
+        "Provide a meta description (max 150 characters) in English. "
+        "Estimate the recommended visit duration in hours (use decimals: 0.30 for 30 minutes, 1 for 1 hour, etc.) based on the site's complexity and historical significance.\n\n"
+        "For this worker, return JSON keys: categories, short_en, long_en, meta_en, duration. "
+        "short_en must contain the prompt's short description. long_en must contain the prompt's long description."
     )
 
 
@@ -1311,12 +1350,13 @@ _PERM_COPY_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
+        "categories": {"type": "string"},
         "short_en": {"type": "string"},
         "long_en": {"type": "string"},
         "meta_en": {"type": "string"},
-        "categories": {"type": "string"},
+        "duration": {"type": "number"},
     },
-    "required": ["short_en", "long_en", "meta_en", "categories"],
+    "required": ["categories", "short_en", "long_en", "meta_en", "duration"],
 }
 
 
@@ -1361,7 +1401,7 @@ async def generate_copy(
                         "schema": _PERM_COPY_SCHEMA,
                     },
                 },
-                max_output_tokens=3500,
+                max_output_tokens=16000,  # generous: gpt-5 reasoning shares this budget; old code had no cap
             ),
             max_attempts=3,
         )
@@ -1377,7 +1417,7 @@ async def generate_copy(
                         {"role": "user", "content": prompt},
                     ],
                     text={"verbosity": "low", "format": {"type": "json_object"}},
-                    max_output_tokens=3500,
+                    max_output_tokens=16000,  # generous: gpt-5 reasoning shares this budget; old code had no cap
                 ),
                 max_attempts=2,
             )
@@ -1393,11 +1433,25 @@ async def generate_copy(
         )
         return {}
 
+    # Duration parsing restored from the original enrich_place_sync():
+    # missing/zero/invalid -> 1.0 hour default.
+    try:
+        duration = obj.get("duration", None)
+        if duration is None or duration == 0 or (
+            isinstance(duration, (int, float, str)) and float(duration) <= 0
+        ):
+            duration = 1.0
+        else:
+            duration = float(duration)
+    except Exception:
+        duration = 1.0
+
     return {
-        "short_en": _coerce_str(obj.get("short_en")),
-        "long_en": _coerce_str(obj.get("long_en")),
+        "short_en": _coerce_str(obj.get("short_en")) or _coerce_str(obj.get("short")),
+        "long_en": _coerce_str(obj.get("long_en")) or _coerce_str(obj.get("long")),
         "meta_en": _coerce_str(obj.get("meta_en")),
         "categories": _normalise_categories(_coerce_str(obj.get("categories"))),
+        "duration": duration,
     }
 
 
@@ -1406,10 +1460,11 @@ async def generate_copy(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+# System message restored VERBATIM from the original scrape_destinations.py
+# translate_descriptions() call.
 _PERM_TRANSLATE_SYSTEM = (
-    "You are a professional translator specialising in travel content. "
-    "You translate faithfully, preserve historical and factual accuracy, "
-    "keep HTML tags intact, and respond only with JSON matching the provided schema."
+    "You are a professional translator specializing in travel content. "
+    "Maintain accuracy, tone, and formatting."
 )
 
 
@@ -1421,39 +1476,28 @@ def _build_translate_prompt(
     long_en: str,
     meta_en: str,
 ) -> str:
-    return (
-        f'Translate these travel descriptions for "{name}" in {city} from English '
-        "to French, Spanish, Italian, Russian, and Chinese (Simplified).\n\n"
-        "Also translate the city name itself for each target language (e.g. "
-        "Florence -> Florence/Florencia/Firenze/Флоренция/佛罗伦萨). If the city "
-        "name does not have an established local translation, return it unchanged.\n\n"
-        f"SHORT DESCRIPTION (English):\n{short_en}\n\n"
-        f"LONG DESCRIPTION (English, HTML):\n{long_en}\n\n"
-        f"META DESCRIPTION (English):\n{meta_en}\n\n"
-        "Requirements:\n"
-        "- Maintain the same HTML formatting in long descriptions.\n"
-        "- Keep the same tone and informal style; address the reader directly where the source does.\n"
-        "- Preserve historical accuracy and factual information; do not invent details.\n"
-        "- Maintain British English spelling conventions in the source meaning.\n"
-        "- Do not use em/en dash characters (— or –); rewrite with commas or parentheses.\n"
-        "- Translate ALL text into the target language, including proper nouns, "
-        "artwork titles, building names, and place names. Use the established "
-        "local-language form when one exists (e.g. The Birth of Venus -> "
-        "La Naissance de Vénus / El nacimiento de Venus / La Nascita di Venere / "
-        "Рождение Венеры / 维纳斯的诞生). If no established translation exists, "
-        "transliterate or keep the original — but never leave English text "
-        "embedded inside a translated paragraph.\n"
-        "- For Chinese (zh), translate everything into Simplified Chinese; do "
-        "not leave Latin-script names embedded in the prose.\n\n"
-        "Return ONLY a JSON object with this exact structure:\n"
-        "{\n"
-        '  "fr": {"short": "...", "long": "...", "meta": "...", "city": "..."},\n'
-        '  "es": {"short": "...", "long": "...", "meta": "...", "city": "..."},\n'
-        '  "it": {"short": "...", "long": "...", "meta": "...", "city": "..."},\n'
-        '  "ru": {"short": "...", "long": "...", "meta": "...", "city": "..."},\n'
-        '  "zh": {"short": "...", "long": "...", "meta": "...", "city": "..."}\n'
-        "}"
-    )
+    """Prompt restored VERBATIM from the original translate_descriptions()."""
+    return f"""Translate these travel descriptions for "{name}" in {city} from English to French, Spanish, Italian, Russian and Chinese.
+
+SHORT DESCRIPTION: {short_en}
+
+LONG DESCRIPTION: {long_en}
+
+META DESCRIPTION: {meta_en}
+
+Requirements:
+- Maintain the same HTML formatting in long descriptions
+- Keep the same tone and style
+- Preserve historical accuracy and factual information
+- Maintain British English spelling conventions in the original meaning
+- Return JSON with this exact structure:
+{{
+  "fr": {{"short": "...", "long": "...", "meta": "..."}},
+  "es": {{"short": "...", "long": "...", "meta": "..."}},
+  "it": {{"short": "...", "long": "...", "meta": "..."}},
+  "ru": {{"short": "...", "long": "...", "meta": "..."}},
+  "zh": {{"short": "...", "long": "...", "meta": "..."}}
+}}"""
 
 
 def _build_translate_schema(languages: list[str]) -> dict[str, Any]:
@@ -1464,9 +1508,8 @@ def _build_translate_schema(languages: list[str]) -> dict[str, Any]:
             "short": {"type": "string"},
             "long": {"type": "string"},
             "meta": {"type": "string"},
-            "city": {"type": "string"},
         },
-        "required": ["short", "long", "meta", "city"],
+        "required": ["short", "long", "meta"],
     }
     return {
         "type": "object",
@@ -1478,9 +1521,52 @@ def _build_translate_schema(languages: list[str]) -> dict[str, Any]:
 
 def _empty_translation_bundle() -> dict[str, dict[str, str]]:
     return {
-        lang: {"short": "", "long": "", "meta": "", "city": ""}
+        lang: {"short": "", "long": "", "meta": ""}
         for lang in PERMANENT_LANGUAGES
     }
+
+
+# City-name translation: separate once-per-city call, restored from the
+# original translate_city() (which the old Excel's "Name of site city xx"
+# columns were built from). Cached per city like the original.
+_CITY_TRANSLATIONS_CACHE: dict[str, dict[str, str]] = {}
+
+
+async def translate_city_async(*, client, city: str) -> dict[str, str]:
+    """Prompt restored VERBATIM from the original translate_city().
+    Returns {fr, es, it, ru, zh: translated-city}, defaulting each missing
+    language to the untranslated city name (original behaviour)."""
+    if city in _CITY_TRANSLATIONS_CACHE:
+        return _CITY_TRANSLATIONS_CACHE[city]
+
+    prompt = (
+        f"Translate the city name '{city}' into French, Spanish, Italian, "
+        "Russian and Chinese. Respond in JSON with keys fr, es, it, ru and zh."
+    )
+    js: dict[str, Any] = {}
+    try:
+        resp = await _call_with_backoff(
+            lambda: client.responses.create(
+                model=PERM_TRANSLATION_MODEL,
+                input=[
+                    {"role": "system", "content": "You translate city names."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_output_tokens=400,
+            ),
+            max_attempts=2,
+        )
+        raw = resp.output_text or _extract_response_text(resp) or ""
+        obj = _extract_json_object(_clean_json_content(raw))
+        if isinstance(obj, dict):
+            js = obj
+    except Exception as exc:
+        logger.warning("perm.city_translate.error city=%s err=%r", city, exc)
+
+    out = {lang: _coerce_str(js.get(lang)) or city for lang in PERMANENT_LANGUAGES}
+    _CITY_TRANSLATIONS_CACHE[city] = out
+    logger.info("perm.city_translate city=%s -> %s", city, out)
+    return out
 
 
 async def translate_venue(
@@ -1490,8 +1576,9 @@ async def translate_venue(
     city: str,
     english: dict[str, str],
 ) -> dict[str, dict[str, str]]:
-    """Translate short/long/meta + city name into PERMANENT_LANGUAGES.
-    Returns {lang: {short, long, meta, city}}; empties on failure."""
+    """Translate short/long/meta into PERMANENT_LANGUAGES (original prompt).
+    Returns {lang: {short, long, meta}}; empties on failure. City names are
+    translated separately via translate_city_async (original architecture)."""
     short_en = english.get("short_en", "")
     long_en = english.get("long_en", "")
     meta_en = english.get("meta_en", "")
@@ -1516,8 +1603,10 @@ async def translate_venue(
                         {"role": "system", "content": _PERM_TRANSLATE_SYSTEM},
                         {"role": "user", "content": prompt},
                     ],
+                    # NOTE: no text.verbosity here — gpt-4.1-mini (the
+                    # restored original translation model) rejects that
+                    # gpt-5-family parameter.
                     text={
-                        "verbosity": "low",
                         "format": {
                             "type": "json_schema",
                             "name": "perm_translation_bundle",
@@ -1552,7 +1641,6 @@ async def translate_venue(
             "short": _coerce_str((obj or {}).get("short")),
             "long": _coerce_str((obj or {}).get("long")),
             "meta": _coerce_str((obj or {}).get("meta")),
-            "city": _coerce_str((obj or {}).get("city")),
         }
     return out
 
@@ -1594,6 +1682,10 @@ async def _copy_and_translate_one(
         # Attach copy + translations to the venue dict for the Excel writer.
         venue["copy"] = english
         venue["translations"] = translations
+        # Duration comes from the copy call now (original behaviour: the
+        # gpt-5 enrichment estimated visit duration; default 1.0).
+        if english.get("duration") is not None:
+            venue["duration_hours"] = english["duration"]
         return venue
     except Exception as exc:
         logger.exception(
@@ -1932,6 +2024,10 @@ async def run_permanent_scrape(
         await run_store.update_run(
             run_id, status="translating", current_phase="copy+translate"
         )
+        # City name translated once per city (original translate_city()
+        # behaviour, cached) — feeds the "Name of site city xx" columns.
+        city_translations = await translate_city_async(client=client, city=city)
+
         tasks = [
             _copy_and_translate_one(
                 client=client,
@@ -1947,6 +2043,8 @@ async def run_permanent_scrape(
         ]
         results = await asyncio.gather(*tasks)
         kept = [r for r in results if r is not None]
+        for v in kept:
+            v["city_translations"] = city_translations
 
         if kept:
             await run_store.update_run(
@@ -2055,7 +2153,6 @@ def _venue_to_excel_row(venue: dict[str, Any]) -> list[Any]:
     information = venue.get("official_url", "")
     duration = venue.get("duration_hours")
     duration_s = "" if duration is None else f"{duration}"
-    hours = venue.get("opening_hours", "")
     photo_url = venue.get("photo_url", "")
     photo_credit = venue.get("photo_credit", "")
 
@@ -2066,9 +2163,15 @@ def _venue_to_excel_row(venue: dict[str, Any]) -> list[Any]:
     categories = copy.get("categories", "")
 
     translations = venue.get("translations") or {}
+    # City names come from the once-per-city translate_city call (original
+    # architecture), stamped on the venue by the orchestrator.
+    city_trans = venue.get("city_translations") or {}
 
     def t(lang: str, field: str) -> str:
         return (translations.get(lang) or {}).get(field, "") or ""
+
+    def ct(lang: str) -> str:
+        return city_trans.get(lang, "") or ""
 
     name_city = f"{name}, {city}" if city else name
     row = [
@@ -2089,7 +2192,7 @@ def _venue_to_excel_row(venue: dict[str, Any]) -> list[Any]:
         photo_url,                                # 14 URL of images
         photo_credit,                             # 15 Legends of images
         duration_s,                               # 16 Duration of visit
-        hours,                                    # 17 Opening and closing time
+        "",                                       # 17 Opening and closing time (always empty in the original Excel)
         t("fr", "short"),                         # 18 Short description fr
         t("es", "short"),                         # 19 Short description es
         t("it", "short"),                         # 20 Short description it
@@ -2107,11 +2210,11 @@ def _venue_to_excel_row(venue: dict[str, Any]) -> list[Any]:
         "",                                       # 32 Activity type (unused, matches old code)
         rating_s,                                 # 33 Rating
         name_city,                                # 34 Name of site city (English, dup of col 0)
-        _name_city_for_lang(name, t("fr", "city"), city),   # 35 Name of site city fr
-        _name_city_for_lang(name, t("it", "city"), city),   # 36 Name of site city it
-        _name_city_for_lang(name, t("ru", "city"), city),   # 37 Name of site city ru
-        _name_city_for_lang(name, t("zh", "city"), city),   # 38 Name of site city zh
-        _name_city_for_lang(name, t("es", "city"), city),   # 39 Name of site city es
+        _name_city_for_lang(name, ct("fr"), city),   # 35 Name of site city fr
+        _name_city_for_lang(name, ct("it"), city),   # 36 Name of site city it
+        _name_city_for_lang(name, ct("ru"), city),   # 37 Name of site city ru
+        _name_city_for_lang(name, ct("zh"), city),   # 38 Name of site city zh
+        _name_city_for_lang(name, ct("es"), city),   # 39 Name of site city es
         city,                                     # 40 Real city
     ]
     return [_excel_sanitize(c) for c in row]

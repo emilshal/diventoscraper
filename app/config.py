@@ -74,9 +74,13 @@ class Settings(BaseSettings):
     # ────────────────────────────────────────────────────────────────────────
     OPENAI_PERM_MODEL: str = "gpt-5.2"
     OPENAI_PERM_SEARCH_MODEL: str | None = None  # falls back to OPENAI_PERM_MODEL
-    OPENAI_PERM_COPY_MODEL: str = "gpt-5.2"
-    OPENAI_PERM_TRANSLATION_MODEL: str = "gpt-5.2"
-    OPENAI_PERM_TRANSLATION_FALLBACK_MODEL: str = "gpt-5.2"
+    # Copy + translation models restored to the originals from the
+    # Google-Places-era scrape_destinations.py (client asked for identical
+    # copy/translation behaviour). Search stays on gpt-5.2 — that phase is
+    # new functionality replacing Google Places, no original to match.
+    OPENAI_PERM_COPY_MODEL: str = "gpt-5"
+    OPENAI_PERM_TRANSLATION_MODEL: str = "gpt-4.1-mini"
+    OPENAI_PERM_TRANSLATION_FALLBACK_MODEL: str = "gpt-4.1-mini"
     # Concurrency knobs.
     PERM_COPY_CONCURRENCY: int = 2
     PERM_TRANSLATION_CONCURRENCY: int = 4
