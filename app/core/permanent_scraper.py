@@ -503,8 +503,97 @@ def _head_check_image(url: str, *, timeout: float) -> bool:
 
 _PERM_PHOTO_CACHE: dict[str, dict[str, str] | None] = {}
 
-_WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
 _WIKIPEDIA_UA = "DiventoScraper/1.0 (https://divento.com; contact@divento.com)"
+
+# Cache the chosen Wikipedia language code per country so we hit the AI
+# lookup at most once per (country) per process lifetime.
+_COUNTRY_TO_WIKI_LANG: dict[str, str] = {}
+
+
+def _wikipedia_api_for(lang: str) -> str:
+    """Build the Wikipedia REST API endpoint for a given language code."""
+    return f"https://{lang}.wikipedia.org/w/api.php"
+
+
+def _detect_script_language(text: str) -> str | None:
+    """Return a Wikipedia language code based on the script of `text`, or
+    None if the text is Latin script (ambiguous — caller falls back to the
+    country-based AI lookup)."""
+    if not text:
+        return None
+    # Sample the first 30 non-whitespace chars; covers the common case where
+    # a venue name has a few Latin punctuation chars at the start/end.
+    sample = "".join(c for c in text if not c.isspace())[:30]
+    if not sample:
+        return None
+    # Per-script ranges. Each tuple is (lang_code, min_codepoint, max_codepoint).
+    ranges = [
+        ("ru", 0x0400, 0x04FF),   # Cyrillic
+        ("zh", 0x4E00, 0x9FFF),   # CJK Unified Ideographs
+        ("ja", 0x3040, 0x30FF),   # Hiragana + Katakana (Japanese)
+        ("ko", 0xAC00, 0xD7AF),   # Hangul Syllables (Korean)
+        ("ar", 0x0600, 0x06FF),   # Arabic
+        ("he", 0x0590, 0x05FF),   # Hebrew
+        ("el", 0x0370, 0x03FF),   # Greek
+        ("th", 0x0E00, 0x0E7F),   # Thai
+        ("hi", 0x0900, 0x097F),   # Devanagari (Hindi)
+    ]
+    counts: dict[str, int] = {}
+    for ch in sample:
+        cp = ord(ch)
+        for lang_code, lo, hi in ranges:
+            if lo <= cp <= hi:
+                counts[lang_code] = counts.get(lang_code, 0) + 1
+                break
+    if not counts:
+        return None
+    # Return the script with the most characters in the sample.
+    return max(counts, key=counts.get)
+
+
+async def _lookup_country_wiki_lang(*, client, country: str) -> str:
+    """Ask the model once per country which Wikipedia language code it
+    should map to. Cached. Returns 'en' on any failure (safe default)."""
+    if not country:
+        return "en"
+    key = country.strip().lower()
+    if key in _COUNTRY_TO_WIKI_LANG:
+        return _COUNTRY_TO_WIKI_LANG[key]
+    if client is None:
+        _COUNTRY_TO_WIKI_LANG[key] = "en"
+        return "en"
+    prompt = (
+        f"What is the primary Wikipedia language code (ISO 639-1, two letters) "
+        f"for {country}?\n"
+        'Return ONLY JSON: {"lang": "xx"}.\n'
+        "Examples: Italy -> it, France -> fr, Spain -> es, Germany -> de, "
+        "Portugal -> pt, Brazil -> pt, Russia -> ru, Japan -> ja, China -> zh, "
+        "United Kingdom -> en, United States -> en, Greece -> el, "
+        "Netherlands -> nl, Poland -> pl, Turkey -> tr."
+    )
+    try:
+        resp = await _call_with_backoff(
+            lambda: client.responses.create(
+                model=PERM_COPY_MODEL,
+                input=prompt,
+                max_output_tokens=200,
+            ),
+            max_attempts=2,
+        )
+    except Exception as exc:
+        logger.warning("perm.wiki_lang.error country=%s err=%r", country, exc)
+        _COUNTRY_TO_WIKI_LANG[key] = "en"
+        return "en"
+    raw = resp.output_text or _extract_response_text(resp) or ""
+    obj = _extract_json_object(_clean_json_content(raw))
+    lang = "en"
+    if isinstance(obj, dict):
+        candidate = str(obj.get("lang") or "").strip().lower()
+        if len(candidate) == 2 and candidate.isalpha():
+            lang = candidate
+    _COUNTRY_TO_WIKI_LANG[key] = lang
+    logger.info("perm.wiki_lang country=%s -> %s", country, lang)
+    return lang
 
 
 def _venue_name_match_tokens(venue_name: str, *, name_local: str = "") -> set[str]:
@@ -529,14 +618,22 @@ def _venue_name_match_tokens(venue_name: str, *, name_local: str = "") -> set[st
     return {t for t in tokens if len(t) >= 4 and t not in stop}
 
 
-def _commons_file_url(filename: str, *, thumb_size: int = 1200, timeout: float = 8.0) -> str | None:
+def _commons_file_url(
+    filename: str,
+    *,
+    lang: str = "en",
+    thumb_size: int = 1200,
+    timeout: float = 8.0,
+) -> str | None:
     """Resolve a 'File:...jpg' title to a working upload.wikimedia.org thumb URL
-    by querying the imageinfo API."""
+    by querying the imageinfo API. Pass `lang` to query a non-English Wikipedia
+    (the file lookup works regardless of language because files live on Commons,
+    but querying via the same-language API avoids redirects)."""
     if not filename.lower().startswith("file:"):
         filename = "File:" + filename
     try:
         r = requests.get(
-            _WIKIPEDIA_API,
+            _wikipedia_api_for(lang),
             params={
                 "action": "query",
                 "titles": filename,
@@ -589,6 +686,7 @@ def _wikipedia_lookup_photo(
     venue_name: str,
     city: str,
     name_local: str = "",
+    lang: str = "en",
     thumb_size: int = 1200,
     timeout: float = 8.0,
 ) -> dict[str, str] | None:
@@ -601,18 +699,29 @@ def _wikipedia_lookup_photo(
          that matches a venue-name token; resolve to a thumb URL via
          imageinfo. Skips logos/SVGs/icons.
     Returns dict {image_url, page_url, credit, page_title} or None. Sync;
-    callers should wrap in asyncio.to_thread."""
+    callers should wrap in asyncio.to_thread.
+
+    `lang` selects which Wikipedia to query (en/it/es/fr/etc.). Italian
+    venues in Italian cities often have richer coverage on it.wikipedia.org
+    than the English one. When searching a non-English Wikipedia we use the
+    local-language venue name (name_local) as the primary query term if
+    available, falling back to the English name."""
+    api_url = _wikipedia_api_for(lang)
     headers = {"User-Agent": _WIKIPEDIA_UA, "Accept": "application/json"}
+    # For non-English Wikipedias prefer the local-language name; it'll match
+    # the Italian-titled article (e.g. "Castello Alfonsino") much better than
+    # an English description ("Castello Alfonsino (Castello Aragonese)").
+    primary_name = (name_local.strip() if lang != "en" and name_local else venue_name).strip()
     # Skip appending city when the venue name already contains it (e.g.
     # "Florence Baptistery Florence" dilutes the search; with just
     # "Florence Baptistery" the Baptistery page hits #1).
-    if city.lower() in venue_name.lower():
-        query = venue_name.strip()
+    if city.lower() in primary_name.lower():
+        query = primary_name
     else:
-        query = f"{venue_name} {city}".strip()
+        query = f"{primary_name} {city}".strip()
     try:
         r = requests.get(
-            _WIKIPEDIA_API,
+            api_url,
             params={
                 "action": "query",
                 "list": "search",
@@ -626,12 +735,12 @@ def _wikipedia_lookup_photo(
         hits = (r.json().get("query") or {}).get("search") or []
         if not hits:
             return None
-        page_title = _pick_best_wikipedia_hit(hits, venue_name=venue_name) or hits[0]["title"]
+        page_title = _pick_best_wikipedia_hit(hits, venue_name=primary_name) or hits[0]["title"]
     except Exception as exc:
-        logger.debug("perm.photo.wikipedia_search_err venue=%s err=%r", venue_name, exc)
+        logger.debug("perm.photo.wikipedia_search_err venue=%s lang=%s err=%r", venue_name, lang, exc)
         return None
 
-    page_url = f"https://en.wikipedia.org/wiki/{page_title.replace(' ', '_')}"
+    page_url = f"https://{lang}.wikipedia.org/wiki/{page_title.replace(' ', '_')}"
     credit = f"Wikipedia / Wikimedia Commons — {page_title}"
     # Token-match against the page title too — handles the
     # English→Italian filename mismatch (e.g. venue "National Archaeological
@@ -657,7 +766,7 @@ def _wikipedia_lookup_photo(
     )
     try:
         r = requests.get(
-            _WIKIPEDIA_API,
+            api_url,
             params={
                 "action": "query",
                 "titles": page_title,
@@ -690,7 +799,7 @@ def _wikipedia_lookup_photo(
     # Step 3: scan all images on the page for a name-match.
     try:
         r = requests.get(
-            _WIKIPEDIA_API,
+            api_url,
             params={
                 "action": "query",
                 "titles": page_title,
@@ -713,7 +822,7 @@ def _wikipedia_lookup_photo(
                     continue
                 if not all_tokens or not any(t in lower for t in all_tokens):
                     continue
-                url = _commons_file_url(title, thumb_size=thumb_size, timeout=timeout)
+                url = _commons_file_url(title, lang=lang, thumb_size=thumb_size, timeout=timeout)
                 if url:
                     return {
                         "image_url": url,
@@ -726,6 +835,44 @@ def _wikipedia_lookup_photo(
     return None
 
 
+async def _try_wikipedia_lang(
+    *,
+    venue_name: str,
+    name_local: str,
+    city: str,
+    lang: str,
+) -> dict[str, str] | None:
+    """Run the Wikipedia lookup + HEAD-check for one language. Returns the
+    result dict on success, None if the lookup returned nothing or the URL
+    was dead. Logs why on failure."""
+    wiki = await asyncio.to_thread(
+        _wikipedia_lookup_photo,
+        venue_name=venue_name,
+        city=city,
+        name_local=name_local,
+        lang=lang,
+    )
+    if not (wiki and wiki.get("image_url")):
+        return None
+    ok = await asyncio.to_thread(
+        _head_check_image,
+        wiki["image_url"],
+        timeout=settings.PERM_PHOTO_VERIFY_TIMEOUT_S,
+    )
+    if not ok:
+        logger.info(
+            "perm.photo.wikipedia_dead venue=%s lang=%s url=%s",
+            venue_name, lang, wiki["image_url"][:80],
+        )
+        return None
+    return {
+        "image_url": wiki["image_url"],
+        "page_url": wiki["page_url"],
+        "credit": wiki["credit"],
+        "page_title": wiki["page_title"],
+    }
+
+
 async def _lookup_perm_photo(
     *,
     client,
@@ -736,53 +883,56 @@ async def _lookup_perm_photo(
     official_url: str,
 ) -> dict[str, str] | None:
     """Find a working photo for the venue. Strategy:
-      1. Query Wikipedia's REST API (deterministic, ~150ms, never hallucinates).
-      2. HEAD-verify the returned URL.
-      3. If Wikipedia has no page or the URL is dead, fall back to an
-         OpenAI web_search-grounded lookup (only useful for venues with no
-         Wikipedia article, e.g. small museums or recently opened sites).
+      1. Try English Wikipedia (en.wikipedia.org).
+      2. If no result, detect the local language and try that Wikipedia.
+         Language is detected by character script first (Cyrillic → ru,
+         CJK → zh, Greek → el, etc.) and falls back to a one-shot AI
+         lookup of {country → wiki lang code}, cached per country.
+      3. If both fail, return None — caller substitutes the placeholder.
     Cached per (venue, city, country)."""
     cache_key = f"{venue_name.strip().lower()}|{city.strip().lower()}|{country.strip().lower()}"
     if cache_key in _PERM_PHOTO_CACHE:
         return _PERM_PHOTO_CACHE[cache_key]
 
-    # Wikipedia-only path. The LLM-based fallback was removed: it consistently
-    # returned plausible but wrong matches (e.g. a generic Florence panorama
-    # for the Accademia Gallery) because gpt-5.2 hallucinates Wikimedia URLs.
-    # If Wikipedia doesn't have a page for a venue, the placeholder is
-    # better than a wrong-venue image in Fiona's Excel.
-    wiki = await asyncio.to_thread(
-        _wikipedia_lookup_photo,
-        venue_name=venue_name,
-        city=city,
-        name_local=name_local,
+    # Pass 1: English Wikipedia.
+    result = await _try_wikipedia_lang(
+        venue_name=venue_name, name_local=name_local, city=city, lang="en"
     )
-    if not (wiki and wiki.get("image_url")):
-        logger.info("perm.photo.no_wikipedia venue=%s", venue_name)
-        _PERM_PHOTO_CACHE[cache_key] = None
-        return None
-
-    ok = await asyncio.to_thread(
-        _head_check_image,
-        wiki["image_url"],
-        timeout=settings.PERM_PHOTO_VERIFY_TIMEOUT_S,
-    )
-    if not ok:
-        logger.info(
-            "perm.photo.wikipedia_dead venue=%s url=%s",
-            venue_name, wiki["image_url"][:80],
+    if result is not None:
+        logger.debug(
+            "perm.photo.wikipedia venue=%s lang=en title=%s",
+            venue_name, result["page_title"],
         )
-        _PERM_PHOTO_CACHE[cache_key] = None
-        return None
+        out = {k: result[k] for k in ("image_url", "page_url", "credit")}
+        _PERM_PHOTO_CACHE[cache_key] = out
+        return out
 
-    out = {
-        "image_url": wiki["image_url"],
-        "page_url": wiki["page_url"],
-        "credit": wiki["credit"],
-    }
-    _PERM_PHOTO_CACHE[cache_key] = out
-    logger.debug("perm.photo.wikipedia venue=%s title=%s", venue_name, wiki["page_title"])
-    return out
+    # Pass 2: local-language Wikipedia. Use name_local for script detection
+    # (the local-language name is more likely to be in the local script).
+    local_lang = _detect_script_language(name_local) or _detect_script_language(venue_name)
+    if local_lang is None:
+        # Latin-script venue — derive from country.
+        local_lang = await _lookup_country_wiki_lang(client=client, country=country)
+
+    if local_lang and local_lang != "en":
+        result = await _try_wikipedia_lang(
+            venue_name=venue_name,
+            name_local=name_local,
+            city=city,
+            lang=local_lang,
+        )
+        if result is not None:
+            logger.info(
+                "perm.photo.wikipedia venue=%s lang=%s title=%s (en miss)",
+                venue_name, local_lang, result["page_title"],
+            )
+            out = {k: result[k] for k in ("image_url", "page_url", "credit")}
+            _PERM_PHOTO_CACHE[cache_key] = out
+            return out
+
+    logger.info("perm.photo.no_wikipedia venue=%s tried=en,%s", venue_name, local_lang)
+    _PERM_PHOTO_CACHE[cache_key] = None
+    return None
 
 
 async def _verify_or_replace_photo(
