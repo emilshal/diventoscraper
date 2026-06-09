@@ -935,6 +935,67 @@ async def _lookup_perm_photo(
     return None
 
 
+def _make_image_search_fn(client):
+    """search_fn hook for image_sourcing's openai_search source — the same
+    web_search-grounded call pattern the temp pipeline uses. Returns
+    {url, source_page, title} or None; rights are resolved downstream by
+    the domain resolver."""
+
+    async def _search(query: str) -> dict[str, str] | None:
+        tools = [{"type": "web_search"}] if settings.PERM_ENABLE_WEB_SEARCH else None
+        prompt = (
+            f"Find a direct image URL (jpg/png/webp) of: {query}.\n"
+            "Prefer images hosted on Wikimedia Commons, museum open-access "
+            "collections, Unsplash, or Pexels.\n"
+            'Return ONLY JSON: {"url": "...", "source_page": "...", "title": "..."}.\n'
+            "If you cannot find a real, working image URL, return empty strings. "
+            "Do NOT guess or invent URLs."
+        )
+        try:
+            resp = await _call_with_backoff(
+                lambda: client.responses.create(
+                    model=PERM_SEARCH_MODEL,
+                    input=prompt,
+                    tools=tools,
+                    max_output_tokens=1200,
+                ),
+                max_attempts=2,
+            )
+        except Exception:
+            return None
+        raw = resp.output_text or _extract_response_text(resp) or ""
+        obj = _extract_json_object(_clean_json_content(raw))
+        if not isinstance(obj, dict):
+            return None
+        url = _coerce_str(obj.get("url"))
+        if not url or not _is_likely_image_url(url):
+            return None
+        return {
+            "url": url,
+            "source_page": _coerce_str(obj.get("source_page")),
+            "title": _coerce_str(obj.get("title")),
+        }
+
+    return _search
+
+
+_KIND_FROM_CATEGORY = {
+    "museum": "museum", "gallery": "gallery", "art": "museum",
+    "church": "church", "cathedral": "cathedral", "basilica": "church",
+    "palace": "palace", "castle": "castle", "monument": "monument",
+    "garden": "garden", "park": "park", "viewpoint": "monument",
+    "archaeological": "monument",
+}
+
+
+def _kind_from_venue(venue: dict[str, Any]) -> str:
+    for cat in venue.get("categories") or []:
+        for token, kind in _KIND_FROM_CATEGORY.items():
+            if token in str(cat).lower():
+                return kind
+    return ""
+
+
 async def _verify_or_replace_photo(
     venue: dict[str, Any],
     *,
@@ -942,41 +1003,69 @@ async def _verify_or_replace_photo(
     city: str,
     country: str,
 ) -> dict[str, Any]:
-    """HEAD-verify the photo_url from search. If it's bad, do a targeted
-    web_search-grounded lookup for a real Wikimedia/official-site image.
-    Fall through to the placeholder only if both fail."""
-    url = venue.get("photo_url") or ""
+    """Fill the 4-slot licensed image set (Fiona's image-sourcing spec):
+    hero / secondary / interior / detail, each via the source-priority
+    chain with the strict licence gate. Falls back to the proven
+    multilingual Wikipedia page-image lookup for the hero slot, then to
+    the neutral placeholder."""
+    from app.core.image_sourcing import (
+        Attraction, ImageCandidate, fill_image_set, resolve_domain_license,
+    )
 
-    # Step 1: verify search-phase URL if it looks like an image.
-    if url and _is_likely_image_url(url) and settings.PERM_PHOTO_VERIFY_ENABLED:
-        ok = await asyncio.to_thread(
-            _head_check_image, url, timeout=settings.PERM_PHOTO_VERIFY_TIMEOUT_S
-        )
-        if ok:
-            return venue
-        logger.info("perm.photo.dead venue=%s url=%s", venue["name"], url)
-
-    # Step 2: targeted lookup.
-    found = await _lookup_perm_photo(
-        client=client,
-        venue_name=venue["name"],
-        name_local=venue.get("name_local", "") or "",
+    attraction = Attraction(
+        name=venue.get("name", ""),
         city=city,
         country=country,
-        official_url=venue.get("official_url", ""),
+        website=venue.get("official_url", "") or "",
+        kind=_kind_from_venue(venue),
+        name_local=venue.get("name_local", "") or "",
+        prefetched_search_url=venue.get("photo_url", "") or "",
+        prefetched_search_page=venue.get("source_url", "") or "",
     )
-    if found is not None:
-        venue["photo_url"] = found["image_url"]
-        if found["credit"]:
-            venue["photo_credit"] = found["credit"]
-        logger.info(
-            "perm.photo.replaced venue=%s -> %s", venue["name"], found["image_url"][:80]
-        )
-        return venue
+    image_set = await fill_image_set(attraction)
 
-    # Step 3: fallback to placeholder.
-    venue["photo_url"] = settings.PERM_PHOTO_FALLBACK_URL
-    venue["photo_credit"] = ""
+    # Hero fallback: the multilingual Wikipedia page-image lookup is our
+    # battle-tested discovery path (100% Florence, 92% Brindisi). Its URLs
+    # are upload.wikimedia.org, which the spec's domain resolver accepts.
+    if image_set.slots.get("hero") is None:
+        found = await _lookup_perm_photo(
+            client=client,
+            venue_name=venue["name"],
+            name_local=venue.get("name_local", "") or "",
+            city=city,
+            country=country,
+            official_url=venue.get("official_url", ""),
+        )
+        if found is not None:
+            lic = resolve_domain_license(found["image_url"])
+            if lic != "unknown":
+                image_set.slots["hero"] = ImageCandidate(
+                    url=found["image_url"],
+                    source="wikipedia_pageimage",
+                    license_id=lic,
+                    title=venue["name"],
+                    source_page=found.get("page_url", ""),
+                )
+
+    urls = image_set.urls()
+    credits = image_set.credits()
+    if not urls:
+        urls = [settings.PERM_PHOTO_FALLBACK_URL]
+        credits = [""]
+        filled = 0
+    else:
+        filled = len(urls)
+
+    venue["photo_urls"] = urls
+    venue["photo_credits"] = credits
+    # Back-compat single-photo fields (run_store checkpoints, logs).
+    venue["photo_url"] = urls[0]
+    venue["photo_credit"] = credits[0] if credits else ""
+    venue["image_set"] = image_set.to_dict()
+    logger.info(
+        "perm.photo.set venue=%s filled=%d/4 missing=%s",
+        venue["name"], filled, ",".join(image_set.missing_roles) or "-",
+    )
     return venue
 
 
@@ -1986,6 +2075,11 @@ async def run_permanent_scrape(
         )
         raise RuntimeError("OPENAI_API_KEY not configured")
 
+    # Plug our web_search call into the image-sourcing chain's openai_search
+    # source (spec §5a: "reuse your existing call").
+    from app.core.image_sourcing import set_openai_search_fn
+    set_openai_search_fn(_make_image_search_fn(client))
+
     summary: dict[str, int] = {}
     all_venues: list[dict[str, Any]] = []
 
@@ -2153,8 +2247,13 @@ def _venue_to_excel_row(venue: dict[str, Any]) -> list[Any]:
     information = venue.get("official_url", "")
     duration = venue.get("duration_hours")
     duration_s = "" if duration is None else f"{duration}"
-    photo_url = venue.get("photo_url", "")
-    photo_credit = venue.get("photo_credit", "")
+    # Multi-image slots (image-sourcing spec): comma-joined like the old
+    # Google-Places Excel (`",".join(rec["photo_urls"])` / ", "-joined
+    # attributions). Falls back to the single-photo fields.
+    photo_urls = venue.get("photo_urls") or ([venue.get("photo_url")] if venue.get("photo_url") else [])
+    photo_credits = venue.get("photo_credits") or ([venue.get("photo_credit")] if venue.get("photo_credit") else [])
+    photo_url = ",".join(u for u in photo_urls if u)
+    photo_credit = ", ".join(c for c in photo_credits if c)
 
     copy = venue.get("copy") or {}
     short_en = copy.get("short_en", "")

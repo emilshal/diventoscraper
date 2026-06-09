@@ -99,6 +99,18 @@ class Settings(BaseSettings):
     PERM_PHOTO_VERIFY_ENABLED: int = 1     # HEAD-check each photo URL, drop dead ones
     PERM_PHOTO_VERIFY_TIMEOUT_S: float = 5.0
     PERM_PHOTO_FALLBACK_URL: str = "https://placehold.co/1200x800/png?text=Divento"
+    # Licensed image sourcing (Fiona's 4-slot spec, 2026-06-09).
+    EUROPEANA_API_KEY: str | None = None
+    UNSPLASH_ACCESS_KEY: str | None = None
+    # Official-site images are blocked ("official-unconfirmed") until someone
+    # confirms that site's reuse terms and flips this flag.
+    PERM_IMG_CONFIRM_OFFICIAL_TERMS: int = 0
+    PERM_IMG_ALLOW_OPENAI_SEARCH: int = 1
+    # Generation is the true last resort (generic type photo, never the real
+    # place). Off by default — fall back to the neutral placeholder instead.
+    PERM_IMG_ALLOW_OPENAI_GENERATION: int = 0
+    # Keep licence-unverifiable search hits for manual review (never published).
+    PERM_IMG_SURFACE_UNVERIFIED: int = 1
     # Coordinate sanity check — reject anything outside reasonable city bbox.
     PERM_COORD_SANITY_CHECK_ENABLED: int = 1
     PERM_COORD_MAX_DRIFT_KM: float = 50.0  # if model gives a venue >50km from city center, reject
