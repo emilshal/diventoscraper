@@ -1574,7 +1574,14 @@ async def _assign_city_editorial_ratings_perm_async(
         },
         "required": ["rankings"],
     }
-    max_tokens = max(900, min(4000, 100 + len(venues) * 30))
+    # gpt-5.2 with reasoning=medium reserves a large chunk of the output
+    # budget for reasoning tokens, so the ranking JSON itself only gets
+    # what's left. Each ranking row is ~25 output tokens (id + tier +
+    # JSON punctuation) but we need to leave ~1500 tokens for reasoning
+    # plus headroom. The previous formula bottomed out at 900 which
+    # truncated the output for batches >12 venues and left every venue
+    # rated 3 (perm.rating.invalid_json).
+    max_tokens = max(2500, min(8000, 1500 + len(venues) * 40))
 
     content = ""
     try:
@@ -1626,7 +1633,13 @@ async def _assign_city_editorial_ratings_perm_async(
             if isinstance(arr, list):
                 data = arr
     if not isinstance(data, list):
-        logger.info("perm.rating.invalid_json city=%s — defaulting all to 3", city)
+        # Snip to keep the log readable — first 300 chars usually shows
+        # whether we got a truncated json or some other parse failure.
+        head = (content or "")[:300].replace("\n", "\\n")
+        logger.warning(
+            "perm.rating.invalid_json city=%s n=%d content_len=%d head=%r — defaulting all to 3",
+            city, len(venues), len(content or ""), head,
+        )
         return ["3"] * len(venues)
 
     tier_by_id: dict[int, str] = {}
