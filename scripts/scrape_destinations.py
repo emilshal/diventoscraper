@@ -204,7 +204,11 @@ def _build_start_payload(row: tuple[Any, ...]) -> dict[str, Any]:
 
     payload: dict[str, Any] = {
         "cities": [city_s],
-        "country": country_s or "Italy",
+        # Country may legitimately be blank (Filament rows without a country
+        # field) — pass it through as-is. Do NOT default it: a wrong country
+        # makes the search prompt ask for e.g. "Helsinki, Italy" and the
+        # model honestly finds zero venues.
+        "country": country_s,
         "min_reviews": int(minimum_reviews) if minimum_reviews is not None else 1000,
     }
     return payload

@@ -817,7 +817,7 @@ from app.core.run_store import (
 
 class PermanentRunRequest(BaseModel):
     cities: list[str] = Field(default_factory=list)
-    country: str = "Italy"
+    country: str = ""  # optional; a wrong default poisons the search prompt
     min_reviews: int = 1000
     target_min: int = 15
     target_max: int = 50
@@ -905,7 +905,7 @@ async def perm_start_run(req: PermanentRunRequest) -> dict[str, Any]:
         cities = cities[: settings.PERM_MAX_CITIES]
     if not cities:
         raise HTTPException(status_code=400, detail="cities is required")
-    country = (req.country or "").strip() or "Italy"
+    country = (req.country or "").strip()
     min_reviews = max(0, int(req.min_reviews or 0))
     target_min = max(1, int(req.target_min or 15))
     target_max = max(target_min, int(req.target_max or 50))

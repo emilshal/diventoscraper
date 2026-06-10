@@ -159,7 +159,8 @@ def _build_search_prompt(
         if not already_covered
         else "\n".join(f"  - {name}" for name in already_covered[:60])
     )
-    return f"""You are compiling a list of permanent visitor attractions in {city}, {country}
+    place = f"{city}, {country}" if country else city
+    return f"""You are compiling a list of permanent visitor attractions in {place}
 for a travel guide. Use web_search to verify each venue exists and is currently
 open to the public. Return at most {pass_max_items} items as a JSON array.
 
@@ -417,8 +418,9 @@ async def _lookup_city_center(
         return _CITY_CENTER_CACHE[key]
 
     tools = [{"type": "web_search"}] if settings.PERM_ENABLE_WEB_SEARCH else None
+    place = f"{city}, {country}" if country else city
     prompt = (
-        f"What are the geographic coordinates of the center of {city}, {country}?\n"
+        f"What are the geographic coordinates of the center of {place}?\n"
         'Return ONLY JSON: {"latitude": <number>, "longitude": <number>}.\n'
         "Use decimal degrees. If unsure, return null for both."
     )
@@ -914,7 +916,10 @@ async def _lookup_perm_photo(
     local_lang = _detect_script_language(name_local) or _detect_script_language(venue_name)
     if local_lang is None:
         # Latin-script venue — derive from country.
-        local_lang = await _lookup_country_wiki_lang(client=client, country=country)
+        # When the country is blank (optional field in Filament), ask about
+        # the city instead — "primary Wikipedia language for Helsinki" works
+        # just as well as for Finland.
+        local_lang = await _lookup_country_wiki_lang(client=client, country=country or city)
 
     if local_lang and local_lang != "en":
         result = await _try_wikipedia_lang(
@@ -1090,8 +1095,9 @@ async def _lookup_perm_coords(
         return _PERM_COORD_CACHE[cache_key]
 
     tools = [{"type": "web_search"}] if settings.PERM_ENABLE_WEB_SEARCH else None
+    place = f"{city}, {country}" if country else city
     prompt = (
-        f"What are the geographic coordinates of {venue_name} in {city}, {country}?\n"
+        f"What are the geographic coordinates of {venue_name} in {place}?\n"
         f"Address: {address}\n\n"
         "This is a famous permanent attraction. Its coordinates are documented "
         "on Wikipedia (look for the infobox), on Google Maps, and on official "
