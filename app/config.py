@@ -111,6 +111,13 @@ class Settings(BaseSettings):
     PERM_IMG_ALLOW_OPENAI_GENERATION: int = 0
     # Keep licence-unverifiable search hits for manual review (never published).
     PERM_IMG_SURFACE_UNVERIFIED: int = 1
+    # Image geometry. The Divento photo box was designed around Google's
+    # 1600px mostly-landscape photos — small or portrait images render badly
+    # until the site redesign adds proper cropping. Enforce a minimum size
+    # and request bigger thumbs.
+    PERM_IMG_THUMB_WIDTH: int = 1920
+    PERM_IMG_MIN_WIDTH: int = 1000
+    PERM_IMG_MIN_HEIGHT: int = 600
     # Coordinate sanity check — reject anything outside reasonable city bbox.
     PERM_COORD_SANITY_CHECK_ENABLED: int = 1
     PERM_COORD_MAX_DRIFT_KM: float = 50.0  # if model gives a venue >50km from city center, reject

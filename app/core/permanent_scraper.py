@@ -626,7 +626,7 @@ def _commons_file_url(
     filename: str,
     *,
     lang: str = "en",
-    thumb_size: int = 1200,
+    thumb_size: int = 1920,
     timeout: float = 8.0,
 ) -> str | None:
     """Resolve a 'File:...jpg' title to a working upload.wikimedia.org thumb URL
@@ -691,7 +691,7 @@ def _wikipedia_lookup_photo(
     city: str,
     name_local: str = "",
     lang: str = "en",
-    thumb_size: int = 1200,
+    thumb_size: int = 1920,
     timeout: float = 8.0,
 ) -> dict[str, str] | None:
     """Three-step Wikipedia REST API lookup:

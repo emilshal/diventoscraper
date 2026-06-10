@@ -171,7 +171,10 @@ ROLES: list[tuple[str, list[str], str]] = [
     ("hero", ["", "exterior", "facade", "building"], "landscape"),
     ("secondary", ["aerial view", "panorama", "at night", "side view", "from above"], "landscape"),
     ("interior", ["interior", "main hall", "gallery", "collection", "nave", "inside"], "landscape"),
-    ("detail", ["detail", "architectural detail", "ornament", "sculpture", "relief", "close-up"], "any"),
+    # detail prefers landscape too (the Divento photo box renders portrait
+    # badly until the redesign) — fill_image_set retries it with "any"
+    # orientation when no landscape close-up exists.
+    ("detail", ["detail", "architectural detail", "ornament", "sculpture", "relief", "close-up"], "landscape"),
 ]
 
 
@@ -331,6 +334,16 @@ def _orientation_ok(width: int, height: int, want: str) -> bool:
     if want == "landscape":
         return width >= height
     return True
+
+
+def _size_ok(width: int, height: int) -> bool:
+    """Minimum-dimension gate. The Divento photo box renders small images
+    badly (no site-side cropping until the redesign), so reject anything
+    under the configured floor. Unknown dimensions (0) pass — only the
+    structured sources report size."""
+    if not width or not height:
+        return True
+    return width >= settings.PERM_IMG_MIN_WIDTH and height >= settings.PERM_IMG_MIN_HEIGHT
 
 
 def _strip_html(s: str) -> str:
@@ -497,7 +510,7 @@ async def _src_wikimedia_commons(
     iiprops = {
         "prop": "imageinfo",
         "iiprop": "url|extmetadata|size",
-        "iiurlwidth": 1600,
+        "iiurlwidth": settings.PERM_IMG_THUMB_WIDTH,
         "format": "json",
     }
 
@@ -516,6 +529,8 @@ async def _src_wikimedia_commons(
             if not license_accepted(cand.license_id):
                 continue
             if not _orientation_ok(cand.width, cand.height, orientation):
+                continue
+            if not _size_ok(cand.width, cand.height):
                 continue
             return cand
         return None
@@ -744,6 +759,8 @@ async def _src_unsplash(
             text = f"{photo.get('description') or ''} {photo.get('alt_description') or ''}".lower()
             if name_tokens and not any(t in text for t in name_tokens):
                 continue
+            if not _size_ok(int(photo.get("width") or 0), int(photo.get("height") or 0)):
+                continue
             user = photo.get("user") or {}
             dl = (photo.get("links") or {}).get("download_location") or ""
             if dl:
@@ -927,7 +944,7 @@ async def fill_image_set(attraction: Attraction) -> AttractionImageSet:
     image_set = AttractionImageSet(slots={r: None for r, _, _ in ROLES})
     seen: set[str] = set()
 
-    for role, keywords, orientation in ROLES:
+    async def _fill_role(role: str, keywords: list[str], orientation: str) -> bool:
         for source_id, adapter in _SOURCE_CHAIN:
             try:
                 if adapter is _src_openai_search:
@@ -960,7 +977,17 @@ async def fill_image_set(attraction: Attraction) -> AttractionImageSet:
                 "img.slot_filled name=%s role=%s source=%s licence=%s",
                 attraction.name, role, source_id, cand.license_id,
             )
-            break
+            return True
+        return False
+
+    for role, keywords, orientation in ROLES:
+        await _fill_role(role, keywords, orientation)
+
+    # Detail fallback: a landscape close-up often doesn't exist on Commons;
+    # allow portrait/square rather than leaving the slot empty.
+    if image_set.slots.get("detail") is None:
+        detail_keywords = next(kws for r, kws, _ in ROLES if r == "detail")
+        await _fill_role("detail", detail_keywords, "any")
 
     if image_set.missing_roles:
         logger.info(
