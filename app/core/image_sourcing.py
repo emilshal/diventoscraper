@@ -443,12 +443,31 @@ def _commons_candidate_from_page(page: dict[str, Any]) -> ImageCandidate | None:
     )
 
 
+def _commons_relevance_text(page: dict[str, Any]) -> str:
+    """Title + description + categories of a Commons file, lowercased — used
+    for the wrong-place guard."""
+    parts = [page.get("title") or ""]
+    infos = page.get("imageinfo") or []
+    if infos:
+        meta = infos[0].get("extmetadata") or {}
+        for key in ("ImageDescription", "Categories", "ObjectName"):
+            v = meta.get(key) or {}
+            parts.append(_strip_html(str(v.get("value") or "")))
+    return " ".join(parts).lower()
+
+
 async def _src_wikimedia_commons(
     a: Attraction, role: str, keywords: list[str], orientation: str, seen: set[str]
 ) -> ImageCandidate | None:
     """Workhorse. Per-file licence + author via imageinfo extmetadata —
     the gold standard. Category lookup first (if known), then filetext
-    search with each keyword, English name then local name."""
+    search with each keyword, English name then local name.
+
+    Wrong-place guard: venue names are often shared globally ("Basilica of
+    Saint Nicholas" exists in Bari, Amsterdam, Trnava, ...). Tier 1 searches
+    WITH the city in the query (Commons indexes file description pages, which
+    mention the location). Tier 2 retries without the city but only accepts
+    files whose title/description/categories actually mention the city."""
 
     def _query(params: dict[str, Any]) -> list[dict[str, Any]]:
         data = _http_get_json(_COMMONS_API, params)
@@ -464,10 +483,14 @@ async def _src_wikimedia_commons(
         "format": "json",
     }
 
-    def _walk(pages: list[dict[str, Any]]) -> ImageCandidate | None:
+    city_l = (a.city or "").strip().lower()
+
+    def _walk(pages: list[dict[str, Any]], *, require_city: bool) -> ImageCandidate | None:
         for p in pages:
             title = (p.get("title") or "").lower()
             if title.endswith((".svg", ".gif", ".tif", ".tiff", ".pdf", ".ogg", ".webm")):
+                continue
+            if require_city and city_l and city_l not in _commons_relevance_text(p):
                 continue
             cand = _commons_candidate_from_page(p)
             if cand is None or cand.url in seen:
@@ -479,7 +502,18 @@ async def _src_wikimedia_commons(
             return cand
         return None
 
-    # 1. Category members, if a category is known.
+    def _search(term: str) -> list[dict[str, Any]]:
+        return _query({
+            "action": "query",
+            "generator": "search",
+            "gsrsearch": f"filetype:bitmap {term}",
+            "gsrnamespace": 6,
+            "gsrlimit": 10,
+            **iiprops,
+        })
+
+    # 1. Category members, if a category is known (already venue-scoped, no
+    # city guard needed).
     if a.commons_category:
         pages = await asyncio.to_thread(_query, {
             "action": "query",
@@ -493,26 +527,31 @@ async def _src_wikimedia_commons(
         kw_terms = [k for k in keywords if k]
         if kw_terms:
             filtered = [p for p in pages if any(k in (p.get("title") or "").lower() for k in kw_terms)]
-            cand = _walk(filtered) or None
+            cand = _walk(filtered, require_city=False)
         else:
-            cand = _walk(pages)
+            cand = _walk(pages, require_city=False)
         if cand:
             return cand
 
-    # 2. Filetext search, keyword chain left-to-right, EN then local name.
     names = [a.name] + ([a.name_local] if a.name_local and a.name_local != a.name else [])
+
+    # 2. Tier 1: filetext search WITH the city in the query.
+    for kw in keywords:
+        for nm in names:
+            city_term = "" if (city_l and city_l in nm.lower()) else a.city
+            term = " ".join(t for t in (nm, city_term, kw) if t).strip()
+            pages = await asyncio.to_thread(_search, term)
+            cand = _walk(pages, require_city=False)
+            if cand:
+                return cand
+
+    # 3. Tier 2: name-only search, but require the city to appear in the
+    # file's title/description/categories before accepting.
     for kw in keywords:
         for nm in names:
             term = f"{nm} {kw}".strip()
-            pages = await asyncio.to_thread(_query, {
-                "action": "query",
-                "generator": "search",
-                "gsrsearch": f"filetype:bitmap {term}",
-                "gsrnamespace": 6,
-                "gsrlimit": 10,
-                **iiprops,
-            })
-            cand = _walk(pages)
+            pages = await asyncio.to_thread(_search, term)
+            cand = _walk(pages, require_city=True)
             if cand:
                 return cand
     return None
