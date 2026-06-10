@@ -1054,16 +1054,26 @@ async def _verify_or_replace_photo(
                     source_page=found.get("page_url", ""),
                 )
 
-    urls = image_set.urls()
-    credits = image_set.credits()
+    # The legacy Divento importer was built against the old Google files:
+    # EXACTLY 3 URLs per row (cell ~520-640 chars) and legends of bare
+    # author names ("Colin Gibson, Jeff D'Arcy, Neil King"). Longer cells /
+    # comma-laden licence strings break the import, so the Excel carries at
+    # most 3 images and short author names. The full licence credits stay
+    # in venue["image_set"] (persisted via run_store) for when the site can
+    # display proper CC attribution.
+    urls = image_set.urls()[:3]
+    authors = image_set.authors()[:3]
+    credits = image_set.credits()[:3]
     if not urls:
         urls = [settings.PERM_PHOTO_FALLBACK_URL]
+        authors = [""]
         credits = [""]
         filled = 0
     else:
         filled = len(urls)
 
     venue["photo_urls"] = urls
+    venue["photo_authors"] = authors
     venue["photo_credits"] = credits
     # Back-compat single-photo fields (run_store checkpoints, logs).
     venue["photo_url"] = urls[0]
@@ -2259,13 +2269,15 @@ def _venue_to_excel_row(venue: dict[str, Any]) -> list[Any]:
     information = venue.get("official_url", "")
     duration = venue.get("duration_hours")
     duration_s = "" if duration is None else f"{duration}"
-    # Multi-image slots (image-sourcing spec): comma-joined like the old
-    # Google-Places Excel (`",".join(rec["photo_urls"])` / ", "-joined
-    # attributions). Falls back to the single-photo fields.
-    photo_urls = venue.get("photo_urls") or ([venue.get("photo_url")] if venue.get("photo_url") else [])
-    photo_credits = venue.get("photo_credits") or ([venue.get("photo_credit")] if venue.get("photo_credit") else [])
+    # Multi-image slots, matched EXACTLY to the old Google-Places Excel the
+    # Divento importer was built against: max 3 URLs comma-joined (no
+    # spaces), legends = short author names ", "-joined and parallel to the
+    # URLs ("Colin Gibson, Jeff D'Arcy, Neil King"). Full licence credits
+    # live in venue["image_set"], not in this cell.
+    photo_urls = (venue.get("photo_urls") or ([venue.get("photo_url")] if venue.get("photo_url") else []))[:3]
+    photo_authors = (venue.get("photo_authors") or [])[:3]
     photo_url = ",".join(u for u in photo_urls if u)
-    photo_credit = ", ".join(c for c in photo_credits if c)
+    photo_credit = ", ".join(a for a in photo_authors if a)
 
     copy = venue.get("copy") or {}
     short_en = copy.get("short_en", "")

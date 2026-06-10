@@ -139,6 +139,24 @@ class AttractionImageSet:
     def credits(self) -> list[str]:
         return [c.credit_line() for c in self.slots.values() if c is not None]
 
+    def authors(self) -> list[str]:
+        """Short author names, one per filled slot, parallel to urls().
+        Commas are stripped from within each name because the legacy Excel
+        importer splits the legends cell on commas (old Google files held
+        exactly 'Name, Name, Name'). Falls back to the source label when a
+        file has no author recorded."""
+        out: list[str] = []
+        for c in self.slots.values():
+            if c is None:
+                continue
+            name = (c.author or "").replace(",", " ").strip()
+            name = re.sub(r"\s+", " ", name)
+            if not name:
+                name = "Wikimedia Commons" if c.source == "wikimedia_commons" else c.source.replace("_", " ")
+            # Keep names short like the old Google attributions.
+            out.append(name[:60])
+        return out
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "slots": {r: (c.to_dict() if c else None) for r, c in self.slots.items()},
