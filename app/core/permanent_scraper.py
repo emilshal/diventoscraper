@@ -1061,16 +1061,23 @@ async def _verify_or_replace_photo(
     # most 3 images and short author names. The full licence credits stay
     # in venue["image_set"] (persisted via run_store) for when the site can
     # display proper CC attribution.
-    urls = image_set.urls()[:3]
-    authors = image_set.authors()[:3]
-    credits = image_set.credits()[:3]
-    if not urls:
+    # Additionally: Google URLs never contain '%', and the importer appears
+    # to mangle percent-encoded URLs (a URL-decoded %2C becomes a comma and
+    # shreds the comma-split list). Prefer encoding-free URLs for the Excel;
+    # fall back to encoded ones only when a venue has nothing else.
+    triples = list(zip(image_set.urls(), image_set.authors(), image_set.credits()))
+    clean = [t for t in triples if "%" not in t[0]]
+    chosen = (clean or triples)[:3]
+    if chosen:
+        urls = [u for u, _, _ in chosen]
+        authors = [a for _, a, _ in chosen]
+        credits = [c for _, _, c in chosen]
+        filled = len(urls)
+    else:
         urls = [settings.PERM_PHOTO_FALLBACK_URL]
         authors = [""]
         credits = [""]
         filled = 0
-    else:
-        filled = len(urls)
 
     venue["photo_urls"] = urls
     venue["photo_authors"] = authors

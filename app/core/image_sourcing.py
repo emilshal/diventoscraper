@@ -517,22 +517,29 @@ async def _src_wikimedia_commons(
     city_l = (a.city or "").strip().lower()
 
     def _walk(pages: list[dict[str, Any]], *, require_city: bool) -> ImageCandidate | None:
-        for p in pages:
-            title = (p.get("title") or "").lower()
-            if title.endswith((".svg", ".gif", ".tif", ".tiff", ".pdf", ".ogg", ".webm")):
-                continue
-            if require_city and city_l and city_l not in _commons_relevance_text(p):
-                continue
-            cand = _commons_candidate_from_page(p)
-            if cand is None or cand.url in seen:
-                continue
-            if not license_accepted(cand.license_id):
-                continue
-            if not _orientation_ok(cand.width, cand.height, orientation):
-                continue
-            if not _size_ok(cand.width, cand.height):
-                continue
-            return cand
+        # Two passes: first prefer files whose URL needs no percent-encoding.
+        # The legacy importer was built against Google URLs (plain base64ish
+        # tokens, no '%' anywhere); Wikimedia URLs with %2C (encoded comma)
+        # can shred a comma-split importer after URL-decoding.
+        for clean_only in (True, False):
+            for p in pages:
+                title = (p.get("title") or "").lower()
+                if title.endswith((".svg", ".gif", ".tif", ".tiff", ".pdf", ".ogg", ".webm")):
+                    continue
+                if require_city and city_l and city_l not in _commons_relevance_text(p):
+                    continue
+                cand = _commons_candidate_from_page(p)
+                if cand is None or cand.url in seen:
+                    continue
+                if clean_only and "%" in cand.url:
+                    continue
+                if not license_accepted(cand.license_id):
+                    continue
+                if not _orientation_ok(cand.width, cand.height, orientation):
+                    continue
+                if not _size_ok(cand.width, cand.height):
+                    continue
+                return cand
         return None
 
     def _search(term: str) -> list[dict[str, Any]]:
