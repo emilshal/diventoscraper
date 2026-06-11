@@ -952,8 +952,12 @@ def _make_image_search_fn(client):
         tools = [{"type": "web_search"}] if settings.PERM_ENABLE_WEB_SEARCH else None
         prompt = (
             f"Find a direct image URL (jpg/png/webp) of: {query}.\n"
-            "Prefer images hosted on Wikimedia Commons, museum open-access "
-            "collections, Unsplash, or Pexels.\n"
+            "STRONGLY prefer images hosted on the attraction's OFFICIAL "
+            "website or its media CDN, then museum open-access collections, "
+            "tourism-board sites, Unsplash, or Pexels.\n"
+            "Do NOT return Wikipedia or Wikimedia URLs — those are sourced "
+            "separately.\n"
+            "Prefer large landscape photos (at least ~1000px wide).\n"
             'Return ONLY JSON: {"url": "...", "source_page": "...", "title": "..."}.\n'
             "If you cannot find a real, working image URL, return empty strings. "
             "Do NOT guess or invent URLs."
@@ -1061,13 +1065,24 @@ async def _verify_or_replace_photo(
     # most 3 images and short author names. The full licence credits stay
     # in venue["image_set"] (persisted via run_store) for when the site can
     # display proper CC attribution.
-    # Additionally: Google URLs never contain '%', and the importer appears
-    # to mangle percent-encoded URLs (a URL-decoded %2C becomes a comma and
-    # shreds the comma-split list). Prefer encoding-free URLs for the Excel;
-    # fall back to encoded ones only when a venue has nothing else.
+    # Domain ordering (root cause found 2026-06-11): the importer downloads
+    # each image server-side WITHOUT a User-Agent header, and Wikimedia
+    # rejects those requests with 403 — so Wikimedia URLs silently fail to
+    # import while official-site/CDN URLs work (the Bari planetarium's Met
+    # image was the only one that loaded). Put importable domains first;
+    # Wikimedia URLs only fill leftover slots (they fail individually
+    # without breaking the row, and start working the day the importer
+    # sends a proper UA).
+    def _wikimedia(url: str) -> bool:
+        try:
+            host = urlparse(url).netloc.lower()
+        except Exception:
+            return False
+        return host.endswith(("wikimedia.org", "wikipedia.org"))
+
     triples = list(zip(image_set.urls(), image_set.authors(), image_set.credits()))
-    clean = [t for t in triples if "%" not in t[0]]
-    chosen = (clean or triples)[:3]
+    triples.sort(key=lambda t: _wikimedia(t[0]))  # stable: importable first
+    chosen = triples[:3]
     if chosen:
         urls = [u for u, _, _ in chosen]
         authors = [a for _, a, _ in chosen]

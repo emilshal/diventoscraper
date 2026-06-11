@@ -6,24 +6,33 @@ walking a fixed source-priority chain and stopping at the first image that
 suits the role and carries a verified-reusable licence. Every stored image
 keeps its licence and a ready-to-render attribution string.
 
-Source priority chain (per slot):
-    1   Official site (og:image + JSON-LD)  -> "official-unconfirmed",
-        blocked until PERM_IMG_CONFIRM_OFFICIAL_TERMS is set
+Source priority chain (per slot), reordered 2026-06-11 — the Divento
+importer downloads images server-side WITHOUT a User-Agent header, and
+Wikimedia answers those requests with 403. Official venue sites and the
+CDNs they use serve anonymous requests fine (this is exactly what the
+temp-exhibition pipeline emits, and those always import), so they come
+first and Wikimedia drops to a fallback:
+    1   Official site (og:image + JSON-LD)  -> published in soft mode,
+        "official-confirmed" once PERM_IMG_CONFIRM_OFFICIAL_TERMS is set
     2   Other web sources                    -> pluggable, empty by default
-    3a  Wikimedia Commons                    -> per-file licence via extmetadata
-    3b  Europeana (needs EUROPEANA_API_KEY)  -> reusability=open only
-    3c  Museum open access (Met, Art Inst.)  -> CC0 public-domain subset
-    3d  Gov/heritage bodies                  -> pluggable registry, empty
-    3e  Unsplash (needs UNSPLASH_ACCESS_KEY) -> Unsplash Licence
-    3f  OpenAI web-search                    -> rights resolved by domain,
-        unverifiable rejected (or set aside if PERM_IMG_SURFACE_UNVERIFIED)
-    4   OpenAI generation (gpt-image-1)      -> LAST RESORT, generic type
+    3   OpenAI web-search                    -> aimed at official sites/CDNs;
+        rights resolved by domain, unknown domains published in soft mode,
+        rejected in strict (or set aside if PERM_IMG_SURFACE_UNVERIFIED)
+    4a  Wikimedia Commons                    -> per-file licence via extmetadata
+    4b  Europeana (needs EUROPEANA_API_KEY)  -> reusability=open only
+    4c  Museum open access (Met, Art Inst.)  -> CC0 public-domain subset
+    4d  Gov/heritage bodies                  -> pluggable registry, empty
+    4e  Unsplash (needs UNSPLASH_ACCESS_KEY) -> Unsplash Licence
+    5   OpenAI generation (gpt-image-1)      -> LAST RESORT, generic type
         photo only, never the named place; off by default
 
-Licence gate (Divento is commercial and crops/resizes):
-    accepted:  CC0, Public Domain, CC-BY, CC-BY-SA, Unsplash, Pexels,
-               confirmed official media
-    rejected:  -NC, -ND, unknown/unconfirmed
+Licence gate (PERM_IMG_LICENSE_MODE):
+    strict:    CC0, Public Domain, CC-BY, CC-BY-SA, Unsplash, Pexels,
+               confirmed official media; everything else rejected
+    soft:      strict set PLUS official-site images and web-found images
+               with unconfirmed rights — the policy the temp pipeline has
+               always run with (and the client imports daily)
+    rejected in both modes: -NC, -ND
 
 OpenAI is used in TWO distinct roles here (per spec): web SEARCH finds real
 existing photos whose rights still need domain-resolution; GENERATION makes
@@ -152,7 +161,15 @@ class AttractionImageSet:
             name = (c.author or "").replace(",", " ").strip()
             name = re.sub(r"\s+", " ", name)
             if not name:
-                name = "Wikimedia Commons" if c.source == "wikimedia_commons" else c.source.replace("_", " ")
+                # Official/web images carry no author — credit the hosting
+                # site by domain ("fmirobcn.org"), like the temp pipeline.
+                try:
+                    host = urlparse(c.source_page or c.url).netloc
+                except Exception:
+                    host = ""
+                name = host.removeprefix("www.") or (
+                    "Wikimedia Commons" if c.source == "wikimedia_commons" else c.source.replace("_", " ")
+                )
             # Keep names short like the old Google attributions.
             out.append(name[:60])
         return out
@@ -189,6 +206,7 @@ _LICENSE_DISPLAY = {
     "pexels": "Pexels Licence",
     "official-confirmed": "Official media",
     "official-unconfirmed": "Official media (terms unconfirmed)",
+    "web-unconfirmed": "Web image (rights unconfirmed)",
     "ai-generated": "AI-generated illustration",
 }
 
@@ -242,11 +260,18 @@ def normalise_license(raw: str) -> str:
 
 
 def license_accepted(license_id: str) -> bool:
-    """The safety gate. Strict: commercial use + derivatives must be OK."""
+    """The safety gate. Strict: commercial use + derivatives must be OK.
+    Soft mode (PERM_IMG_LICENSE_MODE) additionally publishes official-site
+    and web-found images with unconfirmed rights, matching the temp
+    pipeline's long-standing policy."""
     if license_id in ("cc0", "public-domain", "unsplash", "pexels", "official-confirmed"):
         return True
     if license_id.startswith("cc-by-sa") or license_id.startswith("cc-by"):
         # normalise_license already filtered NC/ND out of cc-by* ids.
+        return True
+    if settings.PERM_IMG_LICENSE_MODE == "soft" and license_id in (
+        "official-unconfirmed", "web-unconfirmed",
+    ):
         return True
     return False
 
@@ -399,16 +424,22 @@ async def _src_official_site(
                     urls.extend(u for u in img if isinstance(u, str))
                 elif isinstance(img, dict) and img.get("url"):
                     urls.append(img["url"])
+        # Sites often set og:image to their LOGO — useless as a venue photo.
+        # Drop logo-ish filenames, and prefer photo formats over png (logos
+        # are almost always png/svg).
+        deny = re.compile(r"(logo|favicon|icon|sprite|avatar|placeholder|default)[^/]*$", re.IGNORECASE)
+        urls = [u for u in urls if not deny.search(urlparse(u).path or "")]
+        urls.sort(key=lambda u: (urlparse(u).path or "").lower().endswith((".png", ".svg")))
         for u in urls:
             if u and u.startswith("http") and u not in seen:
-                status = (
-                    "ok" if settings.PERM_IMG_CONFIRM_OFFICIAL_TERMS else "blocked-official"
-                )
                 lic = (
                     "official-confirmed"
                     if settings.PERM_IMG_CONFIRM_OFFICIAL_TERMS
                     else "official-unconfirmed"
                 )
+                # Soft mode publishes official venue images even before the
+                # site's reuse terms are formally confirmed (temp parity).
+                status = "ok" if license_accepted(lic) else "blocked-official"
                 return ImageCandidate(
                     url=u, source="official_site", license_id=lic,
                     source_page=a.website, title=a.name, status=status,
@@ -517,29 +548,22 @@ async def _src_wikimedia_commons(
     city_l = (a.city or "").strip().lower()
 
     def _walk(pages: list[dict[str, Any]], *, require_city: bool) -> ImageCandidate | None:
-        # Two passes: first prefer files whose URL needs no percent-encoding.
-        # The legacy importer was built against Google URLs (plain base64ish
-        # tokens, no '%' anywhere); Wikimedia URLs with %2C (encoded comma)
-        # can shred a comma-split importer after URL-decoding.
-        for clean_only in (True, False):
-            for p in pages:
-                title = (p.get("title") or "").lower()
-                if title.endswith((".svg", ".gif", ".tif", ".tiff", ".pdf", ".ogg", ".webm")):
-                    continue
-                if require_city and city_l and city_l not in _commons_relevance_text(p):
-                    continue
-                cand = _commons_candidate_from_page(p)
-                if cand is None or cand.url in seen:
-                    continue
-                if clean_only and "%" in cand.url:
-                    continue
-                if not license_accepted(cand.license_id):
-                    continue
-                if not _orientation_ok(cand.width, cand.height, orientation):
-                    continue
-                if not _size_ok(cand.width, cand.height):
-                    continue
-                return cand
+        for p in pages:
+            title = (p.get("title") or "").lower()
+            if title.endswith((".svg", ".gif", ".tif", ".tiff", ".pdf", ".ogg", ".webm")):
+                continue
+            if require_city and city_l and city_l not in _commons_relevance_text(p):
+                continue
+            cand = _commons_candidate_from_page(p)
+            if cand is None or cand.url in seen:
+                continue
+            if not license_accepted(cand.license_id):
+                continue
+            if not _orientation_ok(cand.width, cand.height, orientation):
+                continue
+            if not _size_ok(cand.width, cand.height):
+                continue
+            return cand
         return None
 
     def _search(term: str) -> list[dict[str, Any]]:
@@ -640,11 +664,20 @@ async def _src_museum_open_access(
     a: Attraction, role: str, keywords: list[str], orientation: str, seen: set[str]
 ) -> ImageCandidate | None:
     """Met + Art Institute open-access. Best for interior/collection shots
-    of museums; skipped for other roles/kinds."""
+    of museums; skipped for other roles/kinds. Only fires when the venue is
+    POSITIVELY known to be a museum/gallery — an unknown kind used to slip
+    through and hand the Bari planetarium a Fra Carnevale painting."""
     if role not in ("interior", "detail"):
         return None
-    if a.kind and a.kind.lower() not in ("museum", "gallery"):
+    if (a.kind or "").lower() not in ("museum", "gallery"):
         return None
+    # These APIs search loosely; require a venue-name token in the result
+    # so we only accept artworks actually associated with the place.
+    name_tokens = {t for t in re.findall(r"[a-z]+", a.name.lower()) if len(t) >= 4}
+
+    def _relevant(*texts: str) -> bool:
+        blob = " ".join(t or "" for t in texts).lower()
+        return not name_tokens or any(t in blob for t in name_tokens)
 
     def _met(term: str) -> ImageCandidate | None:
         data = _http_get_json(
@@ -659,6 +692,8 @@ async def _src_museum_open_access(
                 continue
             url = obj.get("primaryImage") or ""
             if not url or url in seen:
+                continue
+            if not _relevant(obj.get("title"), obj.get("repository"), obj.get("department")):
                 continue
             return ImageCandidate(
                 url=url, source="met_open_access", license_id="cc0",
@@ -679,6 +714,8 @@ async def _src_museum_open_access(
                 continue
             url = f"https://www.artic.edu/iiif/2/{item['image_id']}/full/1686,/0/default.jpg"
             if url in seen:
+                continue
+            if not _relevant(item.get("title"), item.get("artist_display")):
                 continue
             return ImageCandidate(
                 url=url, source="artic_open_access", license_id="cc0",
@@ -809,32 +846,62 @@ async def _src_openai_search(
     if not settings.PERM_IMG_ALLOW_OPENAI_SEARCH:
         return None
 
+    try:
+        site_host = urlparse(a.website).netloc.lower().removeprefix("www.") if a.website else ""
+    except Exception:
+        site_host = ""
+
     def _resolve(url: str, page: str, title: str) -> ImageCandidate | None:
         if not url or url in seen:
             return None
         lic = resolve_domain_license(url)
+        if lic == "unknown":
+            # An image hosted on the venue's own domain is official media;
+            # anything else web-found is "web-unconfirmed". Soft mode
+            # publishes both (temp parity), strict mode sets them aside.
+            try:
+                host = urlparse(url).netloc.lower().removeprefix("www.")
+            except Exception:
+                host = ""
+            if site_host and (host == site_host or host.endswith("." + site_host)):
+                lic = (
+                    "official-confirmed"
+                    if settings.PERM_IMG_CONFIRM_OFFICIAL_TERMS
+                    else "official-unconfirmed"
+                )
+            else:
+                lic = "web-unconfirmed"
         cand = ImageCandidate(
             url=url, source="openai_search", license_id=lic,
             title=title, source_page=page,
         )
-        if lic == "unknown":
+        if not license_accepted(lic):
             cand.status = "unverified"
             if settings.PERM_IMG_SURFACE_UNVERIFIED and unverified_sink is not None:
                 unverified_sink.append(cand)
             return None  # never auto-published
-        if not license_accepted(lic):
-            return None
         return cand
 
     # Zero-cost first: the search phase may already have found a photo.
+    # Skip Wikimedia prefetches — the Commons adapter sources those with
+    # proper per-file licence/author metadata, and this source's job is now
+    # to find the importable official/CDN image first.
     if role == "hero" and a.prefetched_search_url:
-        cand = _resolve(a.prefetched_search_url, a.prefetched_search_page, a.name)
-        if cand:
-            return cand
+        try:
+            pre_host = urlparse(a.prefetched_search_url).netloc.lower()
+        except Exception:
+            pre_host = ""
+        if not pre_host.endswith(("wikimedia.org", "wikipedia.org")):
+            cand = _resolve(a.prefetched_search_url, a.prefetched_search_page, a.name)
+            if cand:
+                return cand
 
     if _OPENAI_SEARCH_FN is None:
         return None
-    for kw in keywords:
+    # This source now runs BEFORE Wikimedia for every role — cap the search
+    # calls per role so a venue with no web-findable photos doesn't burn a
+    # model call per keyword.
+    for kw in keywords[:2]:
         try:
             hit = await _OPENAI_SEARCH_FN(f"{a.name} {kw}".strip() + (f", {a.city}" if a.city else ""))
         except Exception:
@@ -929,16 +996,20 @@ def _get_sync_openai_client():
 # Entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Chain order per spec §3.
+# Chain order: official venue media and web-found CDN images first — the
+# Divento importer can actually download those (it sends no User-Agent
+# header, which Wikimedia rejects with 403). Wikimedia stays as the
+# licence-gold fallback and becomes primary again the day their importer
+# sends a proper UA.
 _SOURCE_CHAIN = [
     ("official_site", _src_official_site),
     ("other_web", _src_other_web),
+    ("openai_search", _src_openai_search),
     ("wikimedia_commons", _src_wikimedia_commons),
     ("europeana", _src_europeana),
     ("museum_open_access", _src_museum_open_access),
     ("gov_heritage", _src_gov_heritage),
     ("unsplash", _src_unsplash),
-    ("openai_search", _src_openai_search),
     ("openai_generation", _src_openai_generation),
 ]
 

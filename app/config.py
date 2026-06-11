@@ -102,8 +102,18 @@ class Settings(BaseSettings):
     # Licensed image sourcing (Fiona's 4-slot spec, 2026-06-09).
     EUROPEANA_API_KEY: str | None = None
     UNSPLASH_ACCESS_KEY: str | None = None
-    # Official-site images are blocked ("official-unconfirmed") until someone
-    # confirms that site's reuse terms and flips this flag.
+    # Licence gate mode, mirroring TEMP_IMAGE_LICENSE_MODE. "strict" only
+    # publishes explicitly reuse-licensed images (CC0/PD/CC-BY*/Unsplash/
+    # Pexels/confirmed-official). "soft" additionally publishes official
+    # venue-site and web-found images with unconfirmed rights — the same
+    # policy the temp pipeline has always run with. Switched to soft on
+    # 2026-06-11: the Divento importer cannot download from Wikimedia
+    # (403 without a User-Agent header), so strict mode left attractions
+    # effectively imageless on the live site.
+    PERM_IMG_LICENSE_MODE: str = "soft"  # strict|soft
+    # Official-site images are marked "official-confirmed" once someone
+    # confirms that site's reuse terms and flips this flag. In soft mode
+    # they are published either way (as "official-unconfirmed").
     PERM_IMG_CONFIRM_OFFICIAL_TERMS: int = 0
     PERM_IMG_ALLOW_OPENAI_SEARCH: int = 1
     # Generation is the true last resort (generic type photo, never the real
